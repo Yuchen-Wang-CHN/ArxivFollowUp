@@ -1,0 +1,45 @@
+# Dependencies and bundled development runtimes
+node_modules/
+.runtime/
+
+# Local application data (may contain reading history and AI settings)
+data/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.ssh/
+
+# Test and coverage output
+.tmp-ui-test/
+coverage/
+.nyc_output/
+
+# Logs and process files
+*.log
+*.pid
+npm-debug.log*
+
+# Editors and operating systems
+.idea/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+~$*

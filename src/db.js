@@ -1,0 +1,514 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { AI_DEFAULT_BASE_URL, AI_DEFAULT_MODEL, BACKUP_DIRECTORY, DATABASE_PATH, SCHEMA_VERSION } from './config.js';
+
+const TABLES_IN_RESTORE_ORDER = [
+  'settings',
+  'category_cache',
+  'subscriptions',
+  'papers',
+  'paper_versions',
+  'paper_ai_analyses',
+  'paper_subscriptions',
+  'user_paper_states',
+  'collections',
+  'paper_collections',
+  'sync_runs',
+];
+const databasePaths = new WeakMap();
+
+function ensureParentDirectory(filePath) {
+  if (filePath !== ':memory:') fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+export function createDatabase(databasePath = DATABASE_PATH) {
+  ensureParentDirectory(databasePath);
+  const db = new DatabaseSync(databasePath, { timeout: 5_000 });
+  databasePaths.set(db, databasePath);
+  db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
+  migrate(db);
+  return db;
+}
+
+function migrate(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS category_cache (
+      code TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      group_code TEXT NOT NULL,
+      group_name TEXT NOT NULL,
+      refreshed_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id INTEGER PRIMARY KEY,
+      category TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+      last_sync_result TEXT NOT NULL DEFAULT 'never' CHECK (last_sync_result IN ('never', 'success', 'error')),
+      last_successful_sync TEXT,
+      last_sync_attempt TEXT,
+      last_error TEXT,
+      etag TEXT,
+      last_modified TEXT,
+      created_at TEXT NOT NULL,
+      paused_at TEXT,
+      unsubscribed_at TEXT
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS papers (
+      id TEXT PRIMARY KEY,
+      latest_version INTEGER NOT NULL CHECK (latest_version > 0),
+      title TEXT NOT NULL,
+      authors TEXT NOT NULL,
+      abstract TEXT NOT NULL,
+      categories_json TEXT NOT NULL,
+      announced_at TEXT,
+      first_seen_at TEXT NOT NULL,
+      last_version_seen_at TEXT NOT NULL,
+      arxiv_url TEXT NOT NULL,
+      pdf_url TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS paper_versions (
+      paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL CHECK (version > 0),
+      title TEXT NOT NULL,
+      authors TEXT NOT NULL,
+      abstract TEXT NOT NULL,
+      categories_json TEXT NOT NULL,
+      announced_at TEXT,
+      first_seen_at TEXT NOT NULL,
+      arxiv_url TEXT NOT NULL,
+      pdf_url TEXT NOT NULL,
+      announce_type TEXT,
+      PRIMARY KEY (paper_id, version)
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS paper_ai_analyses (
+      paper_id TEXT NOT NULL,
+      paper_version INTEGER NOT NULL CHECK (paper_version > 0),
+      source_hash TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+      trigger TEXT NOT NULL CHECK (trigger IN ('auto', 'manual')),
+      priority INTEGER NOT NULL DEFAULT 0,
+      translation_zh TEXT,
+      explanation_zh TEXT,
+      provider TEXT,
+      model TEXT,
+      prompt_version INTEGER NOT NULL DEFAULT 1,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      queued_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      next_attempt_at TEXT,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      PRIMARY KEY (paper_id, paper_version),
+      FOREIGN KEY (paper_id, paper_version) REFERENCES paper_versions(paper_id, version) ON DELETE CASCADE
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS paper_subscriptions (
+      paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+      subscription_id INTEGER NOT NULL REFERENCES subscriptions(id),
+      matched_category TEXT NOT NULL,
+      first_seen_at TEXT NOT NULL,
+      PRIMARY KEY (paper_id, subscription_id)
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS user_paper_states (
+      paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+      is_read INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
+      unread_reason TEXT CHECK (unread_reason IN ('new', 'manual', 'updated') OR unread_reason IS NULL),
+      read_at TEXT,
+      in_inbox INTEGER NOT NULL DEFAULT 1 CHECK (in_inbox IN (0, 1)),
+      inbox_activity_at TEXT NOT NULL,
+      archived_version INTEGER,
+      archived_at TEXT
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS collections (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      created_at TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS paper_collections (
+      paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+      collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+      added_at TEXT NOT NULL,
+      PRIMARY KEY (paper_id, collection_id)
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS sync_runs (
+      id INTEGER PRIMARY KEY,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL CHECK (status IN ('running', 'success', 'partial', 'error')),
+      new_count INTEGER NOT NULL DEFAULT 0,
+      updated_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      error TEXT
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS idx_papers_announced_at ON papers(announced_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_user_state_inbox_activity ON user_paper_states(in_inbox, inbox_activity_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_paper_subscriptions_subscription ON paper_subscriptions(subscription_id);
+    CREATE INDEX IF NOT EXISTS idx_paper_collections_collection ON paper_collections(collection_id, added_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_ai_queue ON paper_ai_analyses(status, trigger, priority DESC, next_attempt_at, queued_at);
+  `);
+
+  const paperColumns = new Set(db.prepare('PRAGMA table_info(papers)').all().map((column) => column.name));
+  if (!paperColumns.has('published_at')) db.exec('ALTER TABLE papers ADD COLUMN published_at TEXT');
+  if (!paperColumns.has('updated_at')) db.exec('ALTER TABLE papers ADD COLUMN updated_at TEXT');
+  if (!paperColumns.has('metadata_enriched_at')) db.exec('ALTER TABLE papers ADD COLUMN metadata_enriched_at TEXT');
+
+  const now = new Date().toISOString();
+  db.prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('refresh_interval_days', '1');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('display_density', 'comfortable');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('ai_processing_mode', 'off');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('ai_base_url', AI_DEFAULT_BASE_URL);
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('ai_model', AI_DEFAULT_MODEL);
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('ai_max_concurrency', '10');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('ai_request_timeout_seconds', '120');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('abstract_display_mode', 'original');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('open_browser_on_start', '1');
+  db.prepare('INSERT OR IGNORE INTO collections (name, created_at) VALUES (?, ?)').run('Favorites', now);
+}
+
+export function transaction(db, callback) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = callback();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+export function getSettings(db) {
+  return Object.fromEntries(db.prepare('SELECT key, value FROM settings').all().map((row) => [row.key, row.value]));
+}
+
+export function setSetting(db, key, value) {
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, String(value));
+}
+
+export function listSubscriptions(db, { includeUnsubscribed = false } = {}) {
+  const where = includeUnsubscribed ? '' : 'WHERE unsubscribed_at IS NULL';
+  return db.prepare(`
+    SELECT *,
+      CASE
+        WHEN enabled = 0 THEN 'paused'
+        WHEN last_sync_result = 'error' THEN 'error'
+        ELSE 'active'
+      END AS status
+    FROM subscriptions ${where}
+    ORDER BY category COLLATE NOCASE
+  `).all();
+}
+
+export function listCollections(db) {
+  return db.prepare(`
+    SELECT c.*, COUNT(pc.paper_id) AS paper_count
+    FROM collections c
+    LEFT JOIN paper_collections pc ON pc.collection_id = c.id
+    GROUP BY c.id
+    ORDER BY CASE WHEN c.name = 'Favorites' THEN 0 ELSE 1 END, c.name COLLATE NOCASE
+  `).all();
+}
+
+function categoryGroupExpression(valueExpression, cachedGroupExpression) {
+  return `COALESCE(${cachedGroupExpression}, CASE
+    WHEN ${valueExpression} GLOB 'cs.*' THEN 'cs'
+    WHEN ${valueExpression} GLOB 'math.*' THEN 'math'
+    WHEN ${valueExpression} GLOB 'stat.*' THEN 'stat'
+    WHEN ${valueExpression} GLOB 'q-bio.*' THEN 'q-bio'
+    WHEN ${valueExpression} GLOB 'q-fin.*' THEN 'q-fin'
+    WHEN ${valueExpression} GLOB 'eess.*' THEN 'eess'
+    WHEN ${valueExpression} GLOB 'econ.*' THEN 'econ'
+    ELSE 'physics'
+  END)`;
+}
+
+export function listInboxCategoryGroups(db) {
+  const groupExpression = categoryGroupExpression('inbox_category.code', 'cc.group_code');
+  const rows = db.prepare(`
+    WITH inbox_categories AS (
+      SELECT DISTINCT paper_category.value AS code
+      FROM papers p
+      JOIN user_paper_states ups ON ups.paper_id = p.id AND ups.in_inbox = 1
+      JOIN json_each(p.categories_json) paper_category
+    )
+    SELECT inbox_category.code, COALESCE(cc.name, inbox_category.code) AS name,
+      ${groupExpression} AS group_code,
+      COALESCE(cc.group_name, CASE ${groupExpression}
+        WHEN 'cs' THEN 'Computer Science'
+        WHEN 'math' THEN 'Mathematics'
+        WHEN 'stat' THEN 'Statistics'
+        WHEN 'q-bio' THEN 'Quantitative Biology'
+        WHEN 'q-fin' THEN 'Quantitative Finance'
+        WHEN 'eess' THEN 'Electrical Engineering and Systems Science'
+        WHEN 'econ' THEN 'Economics'
+        ELSE 'Physics'
+      END) AS group_name
+    FROM inbox_categories inbox_category
+    LEFT JOIN category_cache cc ON cc.code = inbox_category.code
+    ORDER BY group_name COLLATE NOCASE, inbox_category.code COLLATE NOCASE
+  `).all();
+  const groups = new Map();
+  for (const row of rows) {
+    if (!groups.has(row.group_code)) groups.set(row.group_code, { code: row.group_code, name: row.group_name, categories: [] });
+    groups.get(row.group_code).categories.push({ code: row.code, name: row.name });
+  }
+  return [...groups.values()];
+}
+
+function placeholders(values) {
+  return values.map(() => '?').join(', ');
+}
+
+function filterList(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return [...new Set(values.flatMap((item) => String(item).split(',')).map((item) => item.trim()).filter(Boolean))];
+}
+
+export function listPapers(db, filters = {}) {
+  const view = filters.view ?? 'inbox';
+  const conditions = [];
+  const values = [];
+  let collectionJoin = '';
+
+  if (view === 'archive') conditions.push('ups.in_inbox = 0');
+  else if (view === 'collection') {
+    collectionJoin = 'JOIN paper_collections selected_pc ON selected_pc.paper_id = p.id';
+    conditions.push('selected_pc.collection_id = ?');
+    values.push(Number(filters.collectionId));
+  } else conditions.push('ups.in_inbox = 1');
+
+  if (filters.q) {
+    const query = `%${filters.q.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
+    conditions.push(`(p.title LIKE ? ESCAPE '\\' OR p.authors LIKE ? ESCAPE '\\' OR p.abstract LIKE ? ESCAPE '\\' OR p.id LIKE ? ESCAPE '\\' OR p.categories_json LIKE ? ESCAPE '\\')`);
+    values.push(query, query, query, query, query);
+  }
+  const selectedCategories = filterList(filters.categories ?? filters.category);
+  const selectedCategoryGroups = filterList(filters.categoryGroups ?? filters.categoryGroup);
+  if (selectedCategories.length || selectedCategoryGroups.length) {
+    const groupExpression = categoryGroupExpression('paper_category.value', 'category_definition.group_code');
+    const categoryConditions = [];
+    if (selectedCategories.length) {
+      categoryConditions.push(`paper_category.value IN (${placeholders(selectedCategories)})`);
+      values.push(...selectedCategories);
+    }
+    if (selectedCategoryGroups.length) {
+      categoryConditions.push(`${groupExpression} IN (${placeholders(selectedCategoryGroups)})`);
+      values.push(...selectedCategoryGroups);
+    }
+    conditions.push(`EXISTS (
+      SELECT 1 FROM json_each(p.categories_json) paper_category
+      LEFT JOIN category_cache category_definition ON category_definition.code = paper_category.value
+      WHERE ${categoryConditions.join(' OR ')}
+    )`);
+  }
+  if (filters.read === 'read') conditions.push('ups.is_read = 1');
+  if (filters.read === 'unread') conditions.push('ups.is_read = 0');
+  if (filters.updated === 'true') conditions.push("ups.unread_reason = 'updated'");
+  if (filters.collectionFilter) {
+    conditions.push('EXISTS (SELECT 1 FROM paper_collections filter_pc WHERE filter_pc.paper_id = p.id AND filter_pc.collection_id = ?)');
+    values.push(Number(filters.collectionFilter));
+  }
+
+  const timeColumn = view === 'archive'
+    ? 'ups.archived_at'
+    : view === 'collection'
+      ? 'selected_pc.added_at'
+      : 'ups.inbox_activity_at';
+  if (filters.since) {
+    conditions.push(`${timeColumn} >= ?`);
+    values.push(filters.since);
+  }
+
+  const sortColumn = filters.sort === 'updated' || (!filters.sort && view === 'inbox')
+    ? 'COALESCE(p.updated_at, p.announced_at, ups.inbox_activity_at)'
+    : timeColumn;
+  const limit = Math.min(Math.max(Number(filters.limit) || 100, 1), 500);
+  const offset = Math.max(Number(filters.offset) || 0, 0);
+
+  const rows = db.prepare(`
+    SELECT p.*, ups.is_read, ups.unread_reason, ups.in_inbox, ups.inbox_activity_at,
+      ups.archived_version, ups.archived_at,
+      paa.status AS ai_status, paa.explanation_zh, paa.translation_zh IS NOT NULL AS has_translation_zh,
+      GROUP_CONCAT(DISTINCT ps.matched_category) AS matched_categories,
+      GROUP_CONCAT(DISTINCT pc.collection_id) AS collection_ids
+    FROM papers p
+    JOIN user_paper_states ups ON ups.paper_id = p.id
+    ${collectionJoin}
+    LEFT JOIN paper_subscriptions ps ON ps.paper_id = p.id
+    LEFT JOIN paper_collections pc ON pc.paper_id = p.id
+    LEFT JOIN paper_ai_analyses paa ON paa.paper_id = p.id AND paa.paper_version = p.latest_version
+    WHERE ${conditions.join(' AND ')}
+    GROUP BY p.id
+    ORDER BY ${sortColumn} DESC, ups.inbox_activity_at DESC, p.id DESC
+    LIMIT ? OFFSET ?
+  `).all(...values, limit, offset);
+
+  return rows.map((row) => ({
+    ...row,
+    categories: JSON.parse(row.categories_json),
+    matched_categories: row.matched_categories ? row.matched_categories.split(',') : [],
+    collection_ids: row.collection_ids ? row.collection_ids.split(',').map(Number) : [],
+  }));
+}
+
+export function getStats(db) {
+  return db.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN in_inbox = 1 THEN 1 ELSE 0 END), 0) AS inbox,
+      COALESCE(SUM(CASE WHEN in_inbox = 1 AND is_read = 0 THEN 1 ELSE 0 END), 0) AS unread,
+      COALESCE(SUM(CASE WHEN in_inbox = 0 THEN 1 ELSE 0 END), 0) AS archived,
+      COALESCE(SUM(CASE WHEN in_inbox = 1 AND unread_reason = 'updated' THEN 1 ELSE 0 END), 0) AS updated
+    FROM user_paper_states
+  `).get();
+}
+
+function paperSourceHash(title, abstract) {
+  return createHash('sha256').update(`${title}\n${abstract}`).digest('hex');
+}
+
+export function enqueuePaperAnalyses(db, paperIds, trigger = 'manual', options = {}) {
+  const ids = [...new Set(paperIds.map(String))];
+  const result = { selected: ids.length, queued: 0, alreadyCompleted: 0, alreadyQueued: 0, missing: 0 };
+  if (!ids.length) return result;
+  const now = new Date().toISOString();
+  const priority = trigger === 'manual' ? 100 : 0;
+
+  transaction(db, () => {
+    const findPaper = db.prepare('SELECT id, latest_version, title, abstract FROM papers WHERE id = ?');
+    const findAnalysis = db.prepare('SELECT status FROM paper_ai_analyses WHERE paper_id = ? AND paper_version = ?');
+    const insert = db.prepare(`
+      INSERT INTO paper_ai_analyses (
+        paper_id, paper_version, source_hash, status, trigger, priority, queued_at
+      ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
+    `);
+    const retry = db.prepare(`
+      UPDATE paper_ai_analyses SET status = 'pending', trigger = ?, priority = ?, queued_at = ?,
+        started_at = NULL, completed_at = NULL, next_attempt_at = NULL, last_error = NULL
+      WHERE paper_id = ? AND paper_version = ?
+    `);
+    for (const id of ids) {
+      const paper = findPaper.get(id);
+      if (!paper) { result.missing += 1; continue; }
+      const existing = findAnalysis.get(id, paper.latest_version);
+      if (!existing) {
+        insert.run(id, paper.latest_version, paperSourceHash(paper.title, paper.abstract), trigger, priority, now);
+        result.queued += 1;
+      } else if (existing.status === 'succeeded' && !options.force) {
+        result.alreadyCompleted += 1;
+      } else if (['pending', 'running'].includes(existing.status)) {
+        result.alreadyQueued += 1;
+      } else {
+        retry.run(trigger, priority, now, id, paper.latest_version);
+        result.queued += 1;
+      }
+    }
+  });
+  return result;
+}
+
+export function enqueueUnprocessedInboxAnalyses(db) {
+  const ids = db.prepare(`
+    SELECT p.id FROM papers p
+    JOIN user_paper_states ups ON ups.paper_id = p.id
+    LEFT JOIN paper_ai_analyses paa ON paa.paper_id = p.id AND paa.paper_version = p.latest_version
+    WHERE ups.in_inbox = 1 AND paa.paper_id IS NULL
+    ORDER BY ups.inbox_activity_at DESC, p.id
+  `).all().map((row) => row.id);
+  return enqueuePaperAnalyses(db, ids, 'auto');
+}
+
+export function getPaperAiAnalysis(db, paperId) {
+  return db.prepare(`
+    SELECT paa.* FROM papers p
+    LEFT JOIN paper_ai_analyses paa ON paa.paper_id = p.id AND paa.paper_version = p.latest_version
+    WHERE p.id = ?
+  `).get(paperId) ?? null;
+}
+
+export function listPaperAiResults(db, paperIds) {
+  const ids = [...new Set(paperIds.map(String))].slice(0, 100);
+  if (!ids.length) return [];
+  return db.prepare(`
+    SELECT p.id AS paper_id, paa.paper_version, paa.status, paa.explanation_zh,
+      paa.translation_zh IS NOT NULL AS has_translation_zh, paa.last_error
+    FROM papers p
+    LEFT JOIN paper_ai_analyses paa ON paa.paper_id = p.id AND paa.paper_version = p.latest_version
+    WHERE p.id IN (${placeholders(ids)})
+  `).all(...ids);
+}
+
+export function getAiQueueStatus(db) {
+  const rows = db.prepare(`
+    SELECT status, COUNT(*) AS count FROM paper_ai_analyses GROUP BY status
+  `).all();
+  return Object.assign({ pending: 0, running: 0, succeeded: 0, failed: 0 },
+    Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])));
+}
+
+export function exportBackup(db) {
+  const tables = Object.fromEntries(TABLES_IN_RESTORE_ORDER.map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()]));
+  return {
+    format: 'arxiv-follow-up-backup',
+    schemaVersion: SCHEMA_VERSION,
+    exportedAt: new Date().toISOString(),
+    tables,
+  };
+}
+
+export function restoreBackup(db, payload, options = {}) {
+  const compatibleFormats = new Set(['arxiv-follow-up-backup', 'localrss-backup']);
+  if (!payload || !compatibleFormats.has(payload.format) || ![1, 2, SCHEMA_VERSION].includes(payload.schemaVersion) || !payload.tables) {
+    throw new Error('This is not a compatible ArxivFollowUp backup.');
+  }
+
+  const databasePath = databasePaths.get(db);
+  const backupDirectory = options.backupDirectory
+    ?? (databasePath && databasePath !== ':memory:' ? path.join(path.dirname(databasePath), 'backups') : BACKUP_DIRECTORY);
+  fs.mkdirSync(backupDirectory, { recursive: true });
+  const safetyPath = path.join(backupDirectory, `before-restore-${new Date().toISOString().replaceAll(':', '-')}.json`);
+  fs.writeFileSync(safetyPath, JSON.stringify(exportBackup(db), null, 2), 'utf8');
+
+  transaction(db, () => {
+    for (const table of [...TABLES_IN_RESTORE_ORDER].reverse()) db.exec(`DELETE FROM ${table}`);
+    for (const table of TABLES_IN_RESTORE_ORDER) {
+      const rows = table === 'paper_ai_analyses' && !payload.tables[table] ? [] : payload.tables[table];
+      if (!Array.isArray(rows)) throw new Error(`Backup table is missing: ${table}`);
+      for (const row of rows) {
+        const columns = Object.keys(row);
+        if (columns.length === 0) continue;
+        db.prepare(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders(columns)})`).run(...columns.map((column) => row[column]));
+      }
+    }
+  });
+  migrate(db);
+  return safetyPath;
+}
+
+export function closeDatabase(db) {
+  if (db?.isOpen) db.close();
+}

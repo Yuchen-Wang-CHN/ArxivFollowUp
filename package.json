@@ -1,0 +1,26 @@
+{
+  "name": "arxiv-follow-up",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local-first arXiv paper and version follow-up reader",
+  "license": "MIT",
+  "keywords": [
+    "arxiv",
+    "rss",
+    "research",
+    "local-first"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "check": "node --check public/app.js && node --check src/server.js && npm test"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.2.5"
+  }
+}

@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>ArxivFollowUp · AFU</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">A</span>
+        <div><strong>ArxivFollowUp</strong><small>AFU · arXiv tracker</small></div>
+      </div>
+
+      <nav class="primary-nav" aria-label="Main navigation">
+        <button class="nav-item active" data-view="inbox">
+          <span class="nav-icon">⌂</span><span>Inbox</span><span class="nav-count" id="inbox-count" title="Inbox 中尚未归档的论文总数">0</span>
+        </button>
+        <button class="nav-item" data-view="archive"><span class="nav-icon">□</span><span>Archive</span></button>
+        <button class="nav-item" data-view="collections"><span class="nav-icon">◇</span><span>Collections</span></button>
+        <button class="nav-item" data-view="subscriptions"><span class="nav-icon">⌁</span><span>Subscriptions</span></button>
+      </nav>
+
+      <div class="sidebar-spacer"></div>
+      <nav class="primary-nav lower-nav">
+        <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span><span>Settings</span></button>
+      </nav>
+      <div class="local-badge"><span></span>Local only</div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="view-eyebrow">YOUR RESEARCH QUEUE</p>
+          <h1 id="view-title">Inbox</h1>
+        </div>
+        <div class="topbar-actions">
+          <span class="sync-status" id="sync-status">Not synced yet</span>
+          <button class="button secondary" id="sync-button"><span>↻</span> Sync now</button>
+        </div>
+      </header>
+
+      <div class="due-banner hidden" id="due-banner">
+        <div><strong>有订阅需要同步</strong><span id="due-message"></span></div>
+        <button class="button small" id="due-sync-button">Sync now</button>
+      </div>
+
+      <section class="page-panel hidden" id="collections-page"></section>
+
+      <section id="paper-workspace">
+        <div class="workspace-tools">
+          <label class="search-box">
+            <span>⌕</span>
+            <input id="search-input" type="search" placeholder="Search title, author, abstract or arXiv ID" autocomplete="off">
+          </label>
+          <div class="filter-row">
+            <details class="category-multiselect" id="category-filter">
+              <summary aria-label="Category filter"><span id="category-filter-label">All categories</span></summary>
+              <div class="category-filter-menu" id="category-filter-menu"></div>
+            </details>
+            <select id="read-filter" aria-label="Reading state">
+              <option value="">All reading states</option>
+              <option value="unread">Unread</option>
+              <option value="read">Read</option>
+            </select>
+            <select id="updated-filter" aria-label="Updated state">
+              <option value="">All updates</option>
+              <option value="true">Updated to read</option>
+            </select>
+            <select id="time-filter" aria-label="Time range">
+              <option value="">All time</option>
+              <option value="1">Today</option>
+              <option value="7">Last 7 days</option>
+              <option value="30">Last 30 days</option>
+            </select>
+            <select id="sort-filter" aria-label="Sort">
+              <option value="updated">Latest version time</option>
+              <option value="activity">Recent Inbox activity</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="collection-strip hidden" id="collection-strip"></div>
+
+        <div class="list-summary">
+          <label class="select-all"><input type="checkbox" id="select-all"> Select all</label>
+          <span id="paper-summary">0 papers</span>
+        </div>
+
+        <div class="batch-bar hidden" id="batch-bar">
+          <strong id="selected-count">0 selected</strong>
+          <button data-batch="read">Mark read</button>
+          <button data-batch="unread">Mark unread</button>
+          <button data-batch="archive">Archive</button>
+          <button class="hidden" id="batch-ai" data-batch="ai">AI 分析</button>
+          <select id="batch-collection" aria-label="Collection"></select>
+          <button data-batch="addToCollection">Add</button>
+          <button class="batch-close" id="clear-selection" aria-label="Clear selection">×</button>
+        </div>
+
+        <div class="paper-list" id="paper-list"></div>
+        <div class="load-more-wrap hidden" id="load-more-wrap">
+          <button class="button secondary" id="load-more-button">Load 100 more</button>
+        </div>
+      </section>
+
+      <section class="page-panel hidden" id="subscriptions-page">
+        <div class="section-heading">
+          <div><p class="eyebrow">TRACK BY CATEGORY</p><h2>Subscriptions</h2></div>
+        </div>
+        <form class="add-subscription" id="add-subscription-form">
+          <label>
+            <span>Add an arXiv category</span>
+            <input id="category-input" list="category-options" placeholder="例如 cs.LG" autocomplete="off" required>
+            <datalist id="category-options"></datalist>
+          </label>
+          <button class="button" type="submit">Add & sync</button>
+        </form>
+        <div class="subscription-list" id="subscription-list"></div>
+      </section>
+
+      <section class="page-panel hidden" id="settings-page">
+        <div class="section-heading"><div><p class="eyebrow">LOCAL PREFERENCES</p><h2>Settings</h2></div></div>
+        <div class="settings-grid">
+          <article class="settings-card">
+            <h3>Automatic refresh</h3>
+            <p>应用运行期间，所有 Active Subscription 共用同一同步周期。</p>
+            <label>Every
+              <select id="refresh-days">
+                <option value="1">1 day</option><option value="2">2 days</option><option value="3">3 days</option>
+                <option value="4">4 days</option><option value="5">5 days</option><option value="6">6 days</option><option value="7">7 days</option>
+              </select>
+            </label>
+            <label class="checkbox-setting"><input id="open-browser-on-start" type="checkbox"> Windows 启动时自动打开浏览器</label>
+          </article>
+          <article class="settings-card">
+            <h3>Display density</h3>
+            <p>调整论文列表的垂直空间。</p>
+            <select id="display-density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select>
+          </article>
+          <article class="settings-card ai-settings-card">
+            <h3>AI processing</h3>
+            <p>使用独立请求滚动处理论文；每个请求只包含一篇论文。</p>
+            <form id="ai-settings-form" class="ai-settings-form">
+              <label>Mode
+                <select id="ai-mode">
+                  <option value="off">关闭</option>
+                  <option value="auto">自动处理新论文及新版本</option>
+                  <option value="manual">仅处理手动勾选的论文</option>
+                </select>
+              </label>
+              <label>Base URL<input id="ai-base-url" type="url" required></label>
+              <label>Model<input id="ai-model" required></label>
+              <label>Maximum concurrent requests
+                <input id="ai-concurrency" type="number" min="1" max="10" required>
+              </label>
+              <div class="button-row">
+                <button class="button" type="submit">Save AI settings</button>
+                <button class="button secondary" id="test-ai" type="button">Test connection</button>
+              </div>
+            </form>
+            <p class="ai-service-status" id="ai-service-status"></p>
+          </article>
+          <article class="settings-card">
+            <h3>Abstract display</h3>
+            <p>设置论文卡片展开后的默认摘要显示方式，仍可在单篇卡片中临时切换。</p>
+            <select id="abstract-display-mode">
+              <option value="original">原文</option>
+              <option value="translated">中文</option>
+              <option value="bilingual">左右双栏</option>
+            </select>
+          </article>
+          <article class="settings-card">
+            <h3>Category catalog</h3>
+            <p>从 arXiv 刷新本地分类目录；失败时继续使用缓存。</p>
+            <button class="button secondary" id="refresh-categories">Refresh catalog</button>
+          </article>
+          <article class="settings-card danger-card">
+            <h3>Backup & restore</h3>
+            <p>导出完整 JSON 备份。恢复会替换当前数据，并先自动保存安全副本。</p>
+            <div class="button-row">
+              <a class="button secondary" href="/api/backup" download>Export backup</a>
+              <label class="button secondary file-button">Restore backup<input type="file" id="restore-input" accept="application/json,.json"></label>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
