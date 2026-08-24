@@ -6,6 +6,7 @@ const srcDirectory = path.dirname(fileURLToPath(import.meta.url));
 
 export const ROOT_DIRECTORY = path.resolve(srcDirectory, '..');
 export const PUBLIC_DIRECTORY = path.join(ROOT_DIRECTORY, 'public');
+export const KATEX_DIRECTORY = path.join(ROOT_DIRECTORY, 'node_modules', 'katex', 'dist');
 const configuredDataDirectory = process.env.AFU_DATA_DIR ?? process.env.LOCALRSS_DATA_DIR;
 export const DATA_DIRECTORY = configuredDataDirectory
   ? path.resolve(configuredDataDirectory)

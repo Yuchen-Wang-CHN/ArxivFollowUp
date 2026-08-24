@@ -22,7 +22,7 @@ import {
 } from './db.js';
 import { createAiCoordinator, getAiConfiguration, testAiConnection } from './ai.js';
 import { fetchCategoryTaxonomy, getFallbackCategories } from './arxiv.js';
-import { HOST, PORT, PUBLIC_DIRECTORY } from './config.js';
+import { HOST, KATEX_DIRECTORY, PORT, PUBLIC_DIRECTORY } from './config.js';
 import { dueSubscriptions, enrichPaperDates, syncSubscriptions } from './sync.js';
 
 const MIME_TYPES = {
@@ -31,6 +31,9 @@ const MIME_TYPES = {
   '.js': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.ttf': 'font/ttf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
 };
 
 function json(response, status, payload, headers = {}) {
@@ -143,7 +146,12 @@ function changePaperState(db, paperId, action, options = {}) {
       UPDATE user_paper_states SET in_inbox = 0, archived_version = ?, archived_at = ? WHERE paper_id = ?
     `).run(paper.latest_version, now, paperId);
   } else if (action === 'inbox') {
-    db.prepare('UPDATE user_paper_states SET in_inbox = 1, inbox_activity_at = ? WHERE paper_id = ?').run(now, paperId);
+    const collectionCount = db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count;
+    if (collectionCount) throw Object.assign(new Error('Remove the paper from all collections before moving it to Inbox.'), { statusCode: 409 });
+    db.prepare(`
+      UPDATE user_paper_states SET in_inbox = 1, inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
+      WHERE paper_id = ?
+    `).run(now, paperId);
   } else if (action === 'addToCollection') {
     const collectionId = Number(options.collectionId);
     const collection = db.prepare('SELECT id FROM collections WHERE id = ?').get(collectionId);
@@ -151,17 +159,33 @@ function changePaperState(db, paperId, action, options = {}) {
     db.prepare(`
       INSERT OR IGNORE INTO paper_collections (paper_id, collection_id, added_at) VALUES (?, ?, ?)
     `).run(paperId, collectionId, now);
+    db.prepare('UPDATE user_paper_states SET in_inbox = 0 WHERE paper_id = ?').run(paperId);
   } else if (action === 'removeFromCollection') {
-    db.prepare('DELETE FROM paper_collections WHERE paper_id = ? AND collection_id = ?').run(paperId, Number(options.collectionId));
+    const collectionId = Number(options.collectionId);
+    const collection = db.prepare('SELECT id FROM collections WHERE id = ?').get(collectionId);
+    if (!collection) throw Object.assign(new Error('Collection not found.'), { statusCode: 404 });
+    db.prepare('DELETE FROM paper_collections WHERE paper_id = ? AND collection_id = ?').run(paperId, collectionId);
+    const remainingCount = db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count;
+    if (remainingCount === 0) {
+      db.prepare(`
+        UPDATE user_paper_states SET in_inbox = 1, inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
+        WHERE paper_id = ?
+      `).run(now, paperId);
+    }
   } else {
     throw Object.assign(new Error('Unknown paper action.'), { statusCode: 400 });
   }
 }
 
 function serveStatic(response, pathname) {
-  const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const filePath = path.resolve(PUBLIC_DIRECTORY, relative);
-  if (!filePath.startsWith(`${path.resolve(PUBLIC_DIRECTORY)}${path.sep}`) && filePath !== path.join(PUBLIC_DIRECTORY, 'index.html')) {
+  const isKatexAsset = pathname.startsWith('/vendor/katex/');
+  const rootDirectory = isKatexAsset ? KATEX_DIRECTORY : PUBLIC_DIRECTORY;
+  const relative = isKatexAsset
+    ? pathname.slice('/vendor/katex/'.length)
+    : pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const resolvedRoot = path.resolve(rootDirectory);
+  const filePath = path.resolve(resolvedRoot, relative);
+  if (!filePath.startsWith(`${resolvedRoot}${path.sep}`) && filePath !== path.join(resolvedRoot, 'index.html')) {
     json(response, 403, { error: 'Forbidden.' });
     return;
   }
@@ -342,7 +366,7 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
       const paperMatch = url.pathname.match(/^\/api\/papers\/(.+)$/);
       if (request.method === 'PATCH' && paperMatch) {
         const payload = await readJson(request);
-        changePaperState(db, decodeURIComponent(paperMatch[1]), payload.action, payload);
+        transaction(db, () => changePaperState(db, decodeURIComponent(paperMatch[1]), payload.action, payload));
         return json(response, 200, { ok: true, stats: getStats(db) });
       }
 

@@ -26,7 +26,7 @@ test('sync is idempotent and versions only move forward', () => {
   const { db, subscription } = setup();
   const first = ingestFeed(db, subscription, { papers: [item(1)], errors: [] }, '2026-08-20T05:00:00.000Z');
   assert.deepEqual([...first.newIds], ['2508.12345']);
-  assert.equal(getStats(db).inbox, 1);
+  assert.deepEqual({ inbox: getStats(db).inbox, unread: getStats(db).unread }, { inbox: 1, unread: 1 });
 
   const duplicate = ingestFeed(db, subscription, { papers: [item(1)], errors: [] }, '2026-08-21T05:00:00.000Z');
   assert.equal(duplicate.newIds.size, 0);
@@ -34,9 +34,11 @@ test('sync is idempotent and versions only move forward', () => {
   assert.equal(db.prepare('SELECT inbox_activity_at FROM user_paper_states').get().inbox_activity_at, '2026-08-20T05:00:00.000Z');
 
   db.prepare("UPDATE user_paper_states SET is_read = 1, unread_reason = NULL WHERE paper_id = '2508.12345'").run();
+  assert.deepEqual({ inbox: getStats(db).inbox, unread: getStats(db).unread }, { inbox: 1, unread: 0 });
   const update = ingestFeed(db, subscription, { papers: [item(2)], errors: [] }, '2026-08-22T05:00:00.000Z');
   assert.deepEqual([...update.updatedIds], ['2508.12345']);
   assert.deepEqual({ ...db.prepare('SELECT is_read, unread_reason, in_inbox FROM user_paper_states').get() }, { is_read: 0, unread_reason: 'updated', in_inbox: 1 });
+  assert.equal(getStats(db).unread, 1);
 
   db.prepare("UPDATE user_paper_states SET in_inbox = 0, archived_version = 2 WHERE paper_id = '2508.12345'").run();
   ingestFeed(db, subscription, { papers: [item(2)], errors: [] }, '2026-08-23T05:00:00.000Z');

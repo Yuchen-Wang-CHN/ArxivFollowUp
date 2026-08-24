@@ -19,6 +19,9 @@ backups/
 *.key
 .ssh/
 
+# Private product planning
+DESIGN.md
+
 # Test and coverage output
 .tmp-ui-test/
 coverage/

@@ -21,6 +21,7 @@
     "check": "node --check public/app.js && node --check src/server.js && npm test"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.2.5"
+    "fast-xml-parser": "^5.2.5",
+    "katex": "^0.18.4"
   }
 }

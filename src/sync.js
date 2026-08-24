@@ -47,7 +47,10 @@ export function ingestFeed(db, subscription, feed, now = new Date().toISOString(
             is_read = 0,
             unread_reason = CASE WHEN is_read = 1 THEN 'updated' ELSE unread_reason END,
             read_at = NULL,
-            in_inbox = 1,
+            in_inbox = CASE
+              WHEN EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = user_paper_states.paper_id) THEN 0
+              ELSE 1
+            END,
             inbox_activity_at = ?
           WHERE paper_id = ?
         `).run(now, item.id);

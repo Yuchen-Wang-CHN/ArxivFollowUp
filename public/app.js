@@ -13,6 +13,12 @@ const state = {
 };
 
 const PAPER_PAGE_SIZE = 100;
+const LATEX_DELIMITERS = [
+  { left: '$$', right: '$$', display: true },
+  { left: '\\[', right: '\\]', display: true },
+  { left: '\\(', right: '\\)', display: false },
+  { left: '$', right: '$', display: false },
+];
 
 const elements = {
   title: document.querySelector('#view-title'),
@@ -55,6 +61,17 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function renderLatex(root) {
+  if (!root || typeof globalThis.renderMathInElement !== 'function') return;
+  globalThis.renderMathInElement(root, {
+    delimiters: LATEX_DELIMITERS,
+    throwOnError: false,
+    strict: 'ignore',
+    trust: false,
+    errorCallback: () => {},
+  });
 }
 
 function formatDate(value, includeTime = false) {
@@ -112,7 +129,7 @@ function setLoading(loading) {
 function updateStats(stats) {
   if (!state.bootstrap) return;
   state.bootstrap.stats = stats;
-  document.querySelector('#inbox-count').textContent = stats.inbox ?? 0;
+  document.querySelector('#inbox-count').textContent = stats.unread ?? 0;
 }
 
 function updateSyncStatus() {
@@ -206,6 +223,24 @@ function collectionOptions(selectedIds = []) {
   ).join('');
 }
 
+function quickCollectionMenu(paper) {
+  const selected = new Set((paper.collection_ids ?? []).map(Number));
+  const collections = state.bootstrap.collections ?? [];
+  return `
+    <details class="quick-collection">
+      <summary class="icon-button" role="button" title="Manage collections" aria-label="Manage collections">◇</summary>
+      <div class="quick-collection-menu" role="menu">
+        ${collections.map((collection) => {
+          const isSelected = selected.has(Number(collection.id));
+          return `
+          <button type="button" role="menuitem" data-action="${isSelected ? 'removeFromCollection' : 'addToCollection'}" data-collection-id="${collection.id}" title="${isSelected ? 'Remove from' : 'Add to'} ${escapeHtml(collection.name)}">
+            <span>${escapeHtml(collection.name)}</span>${isSelected ? '<span aria-hidden="true">✓</span>' : ''}
+          </button>
+        `; }).join('')}
+      </div>
+    </details>`;
+}
+
 function renderCollectionControls() {
   const collections = state.bootstrap.collections ?? [];
   elements.batchCollection.innerHTML = collectionOptions();
@@ -291,6 +326,7 @@ function paperCard(paper) {
       </div>
       <div class="paper-actions">
         <button class="icon-button" data-action="${isUnread ? 'read' : 'unread'}" title="${isUnread ? 'Mark read' : 'Mark unread'}">${isUnread ? '○' : '●'}</button>
+        ${quickCollectionMenu(paper)}
         <button class="icon-button" data-action="${action}" title="${actionLabel}">${state.view === 'archive' ? '↥' : '□'}</button>
       </div>
       <div class="expanded-actions">
@@ -298,6 +334,7 @@ function paperCard(paper) {
         <a class="button secondary paper-link" href="${escapeHtml(paper.pdf_url)}" target="_blank" rel="noopener">PDF ↗</a>
         <select class="collection-picker" aria-label="Add to collection">${collectionOptions(paper.collection_ids)}</select>
         <button class="text-button" data-action="addToCollection">Add to collection</button>
+        ${state.view === 'collections' ? `<button class="text-button" data-action="removeFromCollection" data-collection-id="${Number(state.collectionId)}">Remove from this collection</button>` : ''}
         <button class="text-button" data-action="versions">Version history</button>
         ${paper.ai_status === 'failed' ? '<button class="text-button" data-action="ai-retry">Retry AI</button>' : ''}
         <div class="version-history"></div>
@@ -333,6 +370,7 @@ function renderPapers() {
   } else {
     elements.paperList.innerHTML = state.papers.map(paperCard).join('');
   }
+  renderLatex(elements.paperList);
   updateSelectionUi();
   ensureAiPolling();
 }
@@ -353,6 +391,7 @@ async function loadPaperAi(card, paperId) {
     const target = abstract.querySelector('.translated-text');
     if (analysis?.status === 'succeeded' && analysis.translation_zh) {
       target.textContent = analysis.translation_zh;
+      renderLatex(target);
       abstract.dataset.aiLoaded = '1';
     } else {
       target.textContent = translationPlaceholder({ ai_status: analysis?.status });
@@ -372,6 +411,7 @@ function patchAiResult(result) {
   if (!card) return;
   const old = card.querySelector('.ai-explanation');
   if (old) old.outerHTML = aiExplanation(paper);
+  renderLatex(card.querySelector('.ai-explanation'));
   if (result.status === 'succeeded') {
     const abstract = card.querySelector('.abstract');
     if (abstract) abstract.dataset.aiLoaded = '0';
@@ -505,13 +545,19 @@ function updateSelectionUi() {
   elements.batchAi.classList.toggle('hidden', state.bootstrap?.ai?.mode !== 'manual');
 }
 
-async function paperAction(paperId, action, extra = {}, reload = true) {
+async function paperAction(paperId, action, extra = {}, reload = true, requestOptions = {}) {
   try {
-    const payload = await api(`/api/papers/${encodeURIComponent(paperId)}`, { method: 'PATCH', body: { action, ...extra } });
+    const payload = await api(`/api/papers/${encodeURIComponent(paperId)}`, {
+      ...requestOptions,
+      method: 'PATCH',
+      body: { action, ...extra },
+    });
     updateStats(payload.stats);
     if (reload) await loadPapers();
+    return payload;
   } catch (error) {
     toast(error.message, 'error');
+    return null;
   }
 }
 
@@ -703,7 +749,7 @@ elements.paperList.addEventListener('click', async (event) => {
   }
 
   if (event.target.closest('.paper-link')) {
-    if (card.classList.contains('unread')) void paperAction(paperId, 'read', {}, false);
+    if (card.classList.contains('unread')) void paperAction(paperId, 'read', {}, false, { keepalive: true });
     return;
   }
 
@@ -731,12 +777,20 @@ elements.paperList.addEventListener('click', async (event) => {
     }
     return;
   }
-  const extra = action === 'addToCollection' ? { collectionId: card.querySelector('.collection-picker').value } : {};
-  await paperAction(paperId, action, extra);
-  if (action === 'addToCollection') {
+  const isCollectionAction = action === 'addToCollection' || action === 'removeFromCollection';
+  const extra = isCollectionAction
+    ? { collectionId: button.dataset.collectionId ?? card.querySelector('.collection-picker').value }
+    : {};
+  button.closest('.quick-collection')?.removeAttribute('open');
+  const result = await paperAction(paperId, action, extra);
+  if (!result) return;
+  if (isCollectionAction) {
     const payload = await api('/api/collections');
     state.bootstrap.collections = payload.collections;
-    toast('Added to collection');
+    renderCollectionControls();
+    if (state.view === 'collections') renderCollectionsManager();
+    renderPapers();
+    toast(action === 'addToCollection' ? 'Added to collection' : 'Removed from collection');
   }
 });
 

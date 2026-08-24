@@ -187,6 +187,10 @@ function migrate(db) {
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('abstract_display_mode', 'original');
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('open_browser_on_start', '1');
   db.prepare('INSERT OR IGNORE INTO collections (name, created_at) VALUES (?, ?)').run('Favorites', now);
+  db.prepare(`
+    UPDATE user_paper_states SET in_inbox = 0
+    WHERE EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = user_paper_states.paper_id)
+  `).run();
 }
 
 export function transaction(db, callback) {
@@ -254,6 +258,7 @@ export function listInboxCategoryGroups(db) {
       FROM papers p
       JOIN user_paper_states ups ON ups.paper_id = p.id AND ups.in_inbox = 1
       JOIN json_each(p.categories_json) paper_category
+      WHERE NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)
     )
     SELECT inbox_category.code, COALESCE(cc.name, inbox_category.code) AS name,
       ${groupExpression} AS group_code,
@@ -294,12 +299,12 @@ export function listPapers(db, filters = {}) {
   const values = [];
   let collectionJoin = '';
 
-  if (view === 'archive') conditions.push('ups.in_inbox = 0');
+  if (view === 'archive') conditions.push('ups.in_inbox = 0 AND ups.archived_at IS NOT NULL');
   else if (view === 'collection') {
     collectionJoin = 'JOIN paper_collections selected_pc ON selected_pc.paper_id = p.id';
     conditions.push('selected_pc.collection_id = ?');
     values.push(Number(filters.collectionId));
-  } else conditions.push('ups.in_inbox = 1');
+  } else conditions.push('ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections inbox_pc WHERE inbox_pc.paper_id = p.id)');
 
   if (filters.q) {
     const query = `%${filters.q.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
@@ -379,11 +384,11 @@ export function getStats(db) {
   return db.prepare(`
     SELECT
       COUNT(*) AS total,
-      COALESCE(SUM(CASE WHEN in_inbox = 1 THEN 1 ELSE 0 END), 0) AS inbox,
-      COALESCE(SUM(CASE WHEN in_inbox = 1 AND is_read = 0 THEN 1 ELSE 0 END), 0) AS unread,
-      COALESCE(SUM(CASE WHEN in_inbox = 0 THEN 1 ELSE 0 END), 0) AS archived,
-      COALESCE(SUM(CASE WHEN in_inbox = 1 AND unread_reason = 'updated' THEN 1 ELSE 0 END), 0) AS updated
-    FROM user_paper_states
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS inbox,
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.is_read = 0 AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS unread,
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 0 AND ups.archived_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS archived,
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.unread_reason = 'updated' AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS updated
+    FROM user_paper_states ups
   `).get();
 }
 
@@ -437,6 +442,7 @@ export function enqueueUnprocessedInboxAnalyses(db) {
     JOIN user_paper_states ups ON ups.paper_id = p.id
     LEFT JOIN paper_ai_analyses paa ON paa.paper_id = p.id AND paa.paper_version = p.latest_version
     WHERE ups.in_inbox = 1 AND paa.paper_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)
     ORDER BY ups.inbox_activity_at DESC, p.id
   `).all().map((row) => row.id);
   return enqueuePaperAnalyses(db, ids, 'auto');

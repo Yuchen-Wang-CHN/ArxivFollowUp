@@ -11,9 +11,14 @@ permissions:
 
 jobs:
   test:
-    name: Node.js 24
-    runs-on: ubuntu-latest
+    name: Node.js 24 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - name: Check out repository
@@ -30,3 +35,17 @@ jobs:
 
       - name: Run checks
         run: npm run check
+
+      - name: Test macOS one-click launcher
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sh -n scripts/afu-macos.sh start-afu.command stop-afu.command
+          export AFU_NODE_PATH="$(command -v node)"
+          export AFU_DATA_DIR="$RUNNER_TEMP/afu-data"
+          export PORT=43111
+          trap 'sh scripts/afu-macos.sh stop || true' EXIT
+          sh scripts/afu-macos.sh start
+          curl --fail --silent "http://127.0.0.1:$PORT/api/bootstrap" >/dev/null
+          sh scripts/afu-macos.sh stop
+          trap - EXIT

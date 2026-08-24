@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>ArxivFollowUp · AFU</title>
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -17,10 +18,10 @@
 
       <nav class="primary-nav" aria-label="Main navigation">
         <button class="nav-item active" data-view="inbox">
-          <span class="nav-icon">⌂</span><span>Inbox</span><span class="nav-count" id="inbox-count" title="Inbox 中尚未归档的论文总数">0</span>
+          <span class="nav-icon">⌂</span><span>Inbox</span><span class="nav-count" id="inbox-count" title="Inbox 中的未读论文数">0</span>
         </button>
-        <button class="nav-item" data-view="archive"><span class="nav-icon">□</span><span>Archive</span></button>
         <button class="nav-item" data-view="collections"><span class="nav-icon">◇</span><span>Collections</span></button>
+        <button class="nav-item" data-view="archive"><span class="nav-icon">□</span><span>Archive</span></button>
         <button class="nav-item" data-view="subscriptions"><span class="nav-icon">⌁</span><span>Subscriptions</span></button>
       </nav>
 
@@ -134,7 +135,7 @@
                 <option value="4">4 days</option><option value="5">5 days</option><option value="6">6 days</option><option value="7">7 days</option>
               </select>
             </label>
-            <label class="checkbox-setting"><input id="open-browser-on-start" type="checkbox"> Windows 启动时自动打开浏览器</label>
+            <label class="checkbox-setting"><input id="open-browser-on-start" type="checkbox"> 启动时自动打开浏览器</label>
           </article>
           <article class="settings-card">
             <h3>Display density</h3>
@@ -192,6 +193,8 @@
   </div>
 
   <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script src="/vendor/katex/katex.min.js"></script>
+  <script src="/vendor/katex/contrib/auto-render.min.js"></script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>
