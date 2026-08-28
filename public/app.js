@@ -324,6 +324,7 @@ function paperClassification(paper) {
 function paperCard(paper) {
   const isUnread = Number(paper.is_read) === 0;
   const isUpdated = paper.unread_reason === 'updated';
+  const archiveClass = state.view === 'archive' ? ' archive-card' : '';
   const categoryChips = paper.categories.slice(0, 4).map((category) => `<span class="category-pill">${escapeHtml(category)}</span>`).join('');
   const extraCategories = paper.categories.length > 4 ? `<span>+${paper.categories.length - 4}</span>` : '';
   const densityClass = state.bootstrap.settings.display_density === 'compact' ? 'compact' : '';
@@ -339,7 +340,7 @@ function paperCard(paper) {
     ? `<span class="classification-badge" title="${classification.confirmed ? '用户确认分类' : 'Embedding 默认预测分类'}">${classification.confirmed ? '' : '≈ '}${escapeHtml(classification.name)}${classification.score == null ? '' : ` · ${classification.score.toFixed(2)}`}</span>`
     : '';
   return `
-    <article class="paper-card ${isUnread ? 'unread' : ''} ${isUpdated ? 'updated' : ''} ${densityClass}${classificationClass}" data-paper-id="${escapeHtml(paper.id)}"${classificationStyle}>
+    <article class="paper-card${archiveClass} ${isUnread ? 'unread' : ''} ${isUpdated ? 'updated' : ''} ${densityClass}${classificationClass}" data-paper-id="${escapeHtml(paper.id)}"${classificationStyle}>
       <label class="paper-check ${state.view === 'archive' ? 'hidden' : ''}"><input class="paper-select" type="checkbox" ${state.selected.has(paper.id) ? 'checked' : ''} aria-label="Select ${escapeHtml(paper.title)}"></label>
       <div class="paper-main" tabindex="0" role="button" aria-expanded="false">
         <div class="paper-title-row">
@@ -371,7 +372,7 @@ function paperCard(paper) {
         <button class="icon-button" data-action="${isUnread ? 'read' : 'unread'}" title="${isUnread ? 'Mark read' : 'Mark unread'}">${isUnread ? '○' : '●'}</button>
         ${quickCollectionMenu(paper)}
         <button class="icon-button" data-action="${action}" title="${actionLabel}">${state.view === 'archive' ? '↥' : '□'}</button>
-        ${state.view === 'archive' ? '<button class="icon-button danger" data-action="purgeArchive" title="删除本地内容">⌫</button>' : ''}
+        ${state.view === 'archive' ? '<button class="icon-button danger archive-delete-button" data-action="purgeArchive" title="删除本地内容">删</button>' : ''}
       </div>
       <div class="expanded-actions">
         <a class="button secondary paper-link" href="${escapeHtml(paper.arxiv_url)}" target="_blank" rel="noopener">arXiv page ↗</a>
