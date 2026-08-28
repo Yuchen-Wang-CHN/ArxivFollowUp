@@ -8,8 +8,11 @@ const state = {
   collectionId: null,
   loading: false,
   hasMorePapers: false,
+  paperPage: 0,
   aiPollTimer: null,
+  embeddingPollTimer: null,
   paperLoadRequest: 0,
+  latestSyncRunId: 0,
 };
 
 const PAPER_PAGE_SIZE = 100;
@@ -26,8 +29,10 @@ const elements = {
   paperWorkspace: document.querySelector('#paper-workspace'),
   paperList: document.querySelector('#paper-list'),
   paperSummary: document.querySelector('#paper-summary'),
-  loadMoreWrap: document.querySelector('#load-more-wrap'),
-  loadMoreButton: document.querySelector('#load-more-button'),
+  pagination: document.querySelector('#pagination'),
+  previousPage: document.querySelector('#previous-page'),
+  nextPage: document.querySelector('#next-page'),
+  pageLabel: document.querySelector('#page-label'),
   search: document.querySelector('#search-input'),
   categoryFilter: document.querySelector('#category-filter'),
   categoryFilterLabel: document.querySelector('#category-filter-label'),
@@ -52,6 +57,9 @@ const elements = {
   dueMessage: document.querySelector('#due-message'),
   batchAi: document.querySelector('#batch-ai'),
   aiServiceStatus: document.querySelector('#ai-service-status'),
+  retryFailedAi: document.querySelector('#retry-failed-ai'),
+  embeddingServiceStatus: document.querySelector('#embedding-service-status'),
+  retryFailedEmbeddings: document.querySelector('#retry-failed-embeddings'),
 };
 
 function escapeHtml(value) {
@@ -61,6 +69,11 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function safeColor(value, fallback = '#64748b') {
+  const color = String(value ?? '').toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(color) ? color : fallback;
 }
 
 function renderLatex(root) {
@@ -234,7 +247,7 @@ function quickCollectionMenu(paper) {
           const isSelected = selected.has(Number(collection.id));
           return `
           <button type="button" role="menuitem" data-action="${isSelected ? 'removeFromCollection' : 'addToCollection'}" data-collection-id="${collection.id}" title="${isSelected ? 'Remove from' : 'Add to'} ${escapeHtml(collection.name)}">
-            <span>${escapeHtml(collection.name)}</span>${isSelected ? '<span aria-hidden="true">✓</span>' : ''}
+            <span><i class="collection-color-dot" style="--collection-color:${safeColor(collection.color)}"></i>${escapeHtml(collection.name)}</span>${isSelected ? '<span aria-hidden="true">✓</span>' : ''}
           </button>
         `; }).join('')}
       </div>
@@ -246,7 +259,7 @@ function renderCollectionControls() {
   elements.batchCollection.innerHTML = collectionOptions();
   if (!state.collectionId && collections.length) state.collectionId = collections[0].id;
   elements.collectionStrip.innerHTML = collections.map((collection) => `
-    <button class="collection-chip ${Number(state.collectionId) === Number(collection.id) ? 'active' : ''}" data-collection-id="${collection.id}">
+    <button class="collection-chip ${Number(state.collectionId) === Number(collection.id) ? 'active' : ''}" data-collection-id="${collection.id}" style="--collection-color:${safeColor(collection.color)}">
       ${escapeHtml(collection.name)} · ${collection.paper_count}
     </button>
   `).join('');
@@ -258,11 +271,17 @@ function renderCollectionsManager() {
     <div class="collection-manage">
       <form id="create-collection-form">
         <input name="name" maxlength="80" placeholder="New collection name" required>
+        <input name="color" type="color" value="#0ea5e9" title="Collection color" aria-label="Collection color">
         <button class="button" type="submit">Create collection</button>
         ${current && current.name !== 'Favorites' ? `<button class="button secondary" id="delete-collection" type="button">Delete “${escapeHtml(current.name)}”</button>` : ''}
       </form>
+      ${current ? `<form id="edit-collection-form" class="edit-collection-form">
+        <label>Current collection color<input name="color" type="color" value="${safeColor(current.color)}"></label>
+        <button class="button secondary" type="submit">Save color</button>
+      </form>` : ''}
     </div>`;
   document.querySelector('#create-collection-form').addEventListener('submit', createCollection);
+  document.querySelector('#edit-collection-form')?.addEventListener('submit', updateCurrentCollection);
   document.querySelector('#delete-collection')?.addEventListener('click', deleteCurrentCollection);
 }
 
@@ -285,6 +304,23 @@ function translationPlaceholder(paper) {
   return '尚未生成中文摘要。';
 }
 
+function paperClassification(paper) {
+  if (state.view === 'archive') {
+    return { name: 'Archive', color: safeColor(state.bootstrap.embeddings?.archiveColor), confirmed: true, score: null };
+  }
+  if (state.view === 'collections') {
+    const collection = state.bootstrap.collections.find((item) => Number(item.id) === Number(state.collectionId));
+    if (collection) return { name: collection.name, color: safeColor(collection.color), confirmed: true, score: null };
+  }
+  if (paper.predicted_target_type === 'collection' && paper.predicted_collection_name) {
+    return {
+      name: paper.predicted_collection_name, color: safeColor(paper.predicted_collection_color), confirmed: false,
+      score: Number(paper.classification_score),
+    };
+  }
+  return null;
+}
+
 function paperCard(paper) {
   const isUnread = Number(paper.is_read) === 0;
   const isUpdated = paper.unread_reason === 'updated';
@@ -296,13 +332,20 @@ function paperCard(paper) {
   const displayedDate = paper.updated_at ?? paper.announced_at;
   const displayedDateLabel = paper.updated_at ? 'Updated' : 'Announced';
   const abstractMode = state.bootstrap.settings.abstract_display_mode ?? 'original';
+  const classification = paperClassification(paper);
+  const classificationStyle = classification ? ` style="--classification-color:${classification.color}"` : '';
+  const classificationClass = classification ? ` classified ${classification.confirmed ? 'classification-confirmed' : 'classification-predicted'}` : '';
+  const classificationBadge = classification
+    ? `<span class="classification-badge" title="${classification.confirmed ? '用户确认分类' : 'Embedding 默认预测分类'}">${classification.confirmed ? '' : '≈ '}${escapeHtml(classification.name)}${classification.score == null ? '' : ` · ${classification.score.toFixed(2)}`}</span>`
+    : '';
   return `
-    <article class="paper-card ${isUnread ? 'unread' : ''} ${isUpdated ? 'updated' : ''} ${densityClass}" data-paper-id="${escapeHtml(paper.id)}">
-      <label class="paper-check"><input class="paper-select" type="checkbox" ${state.selected.has(paper.id) ? 'checked' : ''} aria-label="Select ${escapeHtml(paper.title)}"></label>
+    <article class="paper-card ${isUnread ? 'unread' : ''} ${isUpdated ? 'updated' : ''} ${densityClass}${classificationClass}" data-paper-id="${escapeHtml(paper.id)}"${classificationStyle}>
+      <label class="paper-check ${state.view === 'archive' ? 'hidden' : ''}"><input class="paper-select" type="checkbox" ${state.selected.has(paper.id) ? 'checked' : ''} aria-label="Select ${escapeHtml(paper.title)}"></label>
       <div class="paper-main" tabindex="0" role="button" aria-expanded="false">
         <div class="paper-title-row">
           <h3 class="paper-title">${escapeHtml(paper.title)}</h3>
           ${isUpdated ? '<span class="badge updated">Updated</span>' : ''}
+          ${classificationBadge}
         </div>
         <p class="authors">${escapeHtml(paper.authors || 'Unknown authors')}</p>
         ${aiExplanation(paper)}
@@ -328,6 +371,7 @@ function paperCard(paper) {
         <button class="icon-button" data-action="${isUnread ? 'read' : 'unread'}" title="${isUnread ? 'Mark read' : 'Mark unread'}">${isUnread ? '○' : '●'}</button>
         ${quickCollectionMenu(paper)}
         <button class="icon-button" data-action="${action}" title="${actionLabel}">${state.view === 'archive' ? '↥' : '□'}</button>
+        ${state.view === 'archive' ? '<button class="icon-button danger" data-action="purgeArchive" title="删除本地内容">⌫</button>' : ''}
       </div>
       <div class="expanded-actions">
         <a class="button secondary paper-link" href="${escapeHtml(paper.arxiv_url)}" target="_blank" rel="noopener">arXiv page ↗</a>
@@ -335,6 +379,7 @@ function paperCard(paper) {
         <select class="collection-picker" aria-label="Add to collection">${collectionOptions(paper.collection_ids)}</select>
         <button class="text-button" data-action="addToCollection">Add to collection</button>
         ${state.view === 'collections' ? `<button class="text-button" data-action="removeFromCollection" data-collection-id="${Number(state.collectionId)}">Remove from this collection</button>` : ''}
+        ${state.view === 'archive' ? '<button class="text-button danger" data-action="purgeArchive">删除本地内容</button>' : ''}
         <button class="text-button" data-action="versions">Version history</button>
         ${paper.ai_status === 'failed' ? '<button class="text-button" data-action="ai-retry">Retry AI</button>' : ''}
         <div class="version-history"></div>
@@ -356,15 +401,20 @@ function renderPapers() {
     : state.view === 'archive'
       ? Number(state.bootstrap.stats.archived ?? 0)
       : Number(state.bootstrap.collections.find((collection) => Number(collection.id) === Number(state.collectionId))?.paper_count ?? 0);
+  const firstItem = state.papers.length ? state.paperPage * PAPER_PAGE_SIZE + 1 : 0;
+  const lastItem = state.paperPage * PAPER_PAGE_SIZE + state.papers.length;
   elements.paperSummary.textContent = filtersActive
-    ? `${state.papers.length} shown${state.hasMorePapers ? ' · more available' : ''}`
-    : `Showing ${state.papers.length} of ${viewTotal}`;
-  elements.loadMoreWrap.classList.toggle('hidden', !state.hasMorePapers);
+    ? `Page ${state.paperPage + 1} · ${state.papers.length} shown`
+    : `Showing ${firstItem}–${lastItem} of ${viewTotal}`;
+  elements.pagination.classList.toggle('hidden', state.paperPage === 0 && !state.hasMorePapers);
+  elements.previousPage.disabled = state.paperPage === 0;
+  elements.nextPage.disabled = !state.hasMorePapers;
+  elements.pageLabel.textContent = `Page ${state.paperPage + 1}`;
   if (!state.papers.length) {
     const copy = state.view === 'inbox'
       ? ['Inbox is clear', '新增论文和版本更新会出现在这里。']
       : state.view === 'archive'
-        ? ['Nothing archived', '处理完成的论文会保留在这里。']
+        ? ['Nothing archived', '不感兴趣的论文会保留在这里，直到你明确删除本地内容。']
         : ['Collection is empty', '把论文加入收藏夹后会显示在这里。'];
     elements.paperList.innerHTML = `<div class="empty-state"><div class="empty-mark">✓</div><h3>${copy[0]}</h3><p>${copy[1]}</p></div>`;
   } else {
@@ -373,6 +423,7 @@ function renderPapers() {
   renderLatex(elements.paperList);
   updateSelectionUi();
   ensureAiPolling();
+  ensureEmbeddingPolling();
 }
 
 function updateAiStatusText(status = state.bootstrap?.ai) {
@@ -380,6 +431,27 @@ function updateAiStatusText(status = state.bootstrap?.ai) {
   const modeLabels = { off: '关闭', auto: '自动', manual: '手动' };
   const blocked = status.blockedError ? ` · 已暂停：${status.blockedError}` : '';
   elements.aiServiceStatus.textContent = `模式：${modeLabels[status.mode] ?? status.mode} · 运行中 ${status.running ?? status.active ?? 0} · 等待 ${status.pending ?? 0} · 失败 ${status.failed ?? 0}${blocked}`;
+  if (elements.retryFailedAi) {
+    const failed = Number(status.failed ?? 0);
+    elements.retryFailedAi.textContent = failed ? `重试所有失败论文（${failed}）` : '重试所有失败论文';
+    elements.retryFailedAi.disabled = status.mode === 'off' || failed === 0;
+    elements.retryFailedAi.title = status.mode === 'off'
+      ? '请先启用手动或自动 AI 处理'
+      : failed === 0 ? '当前没有失败论文' : `重新排队 ${failed} 篇失败论文`;
+  }
+}
+
+function updateEmbeddingStatusText(status = state.bootstrap?.embeddings) {
+  if (!status || !elements.embeddingServiceStatus) return;
+  const modeLabels = { off: '关闭', auto: '自动' };
+  const blocked = status.blockedError ? ` · 已暂停：${status.blockedError}` : '';
+  const key = status.apiKeyConfigured ? '已配置密钥' : '未配置密钥';
+  elements.embeddingServiceStatus.textContent = `模式：${modeLabels[status.mode] ?? status.mode} · ${key} · 已嵌入 ${status.succeeded ?? 0} · 等待 ${status.pending ?? 0} · 失败 ${status.failed ?? 0} · 已分类 ${status.classified ?? 0}${blocked}`;
+  if (elements.retryFailedEmbeddings) {
+    const failed = Number(status.failed ?? 0);
+    elements.retryFailedEmbeddings.disabled = status.mode !== 'auto' || failed === 0;
+    elements.retryFailedEmbeddings.textContent = failed ? `重试失败的 Embedding（${failed}）` : '重试失败的 Embedding';
+  }
 }
 
 async function loadPaperAi(card, paperId) {
@@ -437,6 +509,24 @@ function ensureAiPolling() {
   }, 2_000);
 }
 
+function ensureEmbeddingPolling() {
+  if (state.embeddingPollTimer) return;
+  const status = state.bootstrap?.embeddings;
+  if (!status || (Number(status.pending ?? 0) === 0 && Number(status.running ?? status.active ?? 0) === 0)) return;
+  state.embeddingPollTimer = setTimeout(async () => {
+    state.embeddingPollTimer = null;
+    const previousWork = Number(state.bootstrap.embeddings.pending ?? 0) + Number(state.bootstrap.embeddings.running ?? state.bootstrap.embeddings.active ?? 0);
+    try {
+      const payload = await api('/api/embeddings/status');
+      state.bootstrap.embeddings = payload;
+      updateEmbeddingStatusText(payload);
+      const currentWork = Number(payload.pending ?? 0) + Number(payload.running ?? payload.active ?? 0);
+      if (previousWork > 0 && currentWork === 0 && ['inbox', 'archive', 'collections'].includes(state.view)) await loadPapers();
+    } catch {}
+    ensureEmbeddingPolling();
+  }, 2_000);
+}
+
 function currentPaperFilters({ offset = 0, limit = PAPER_PAGE_SIZE + 1 } = {}) {
   const params = new URLSearchParams({ view: state.view === 'collections' ? 'collection' : state.view });
   params.set('offset', String(offset));
@@ -455,7 +545,8 @@ function currentPaperFilters({ offset = 0, limit = PAPER_PAGE_SIZE + 1 } = {}) {
   return params;
 }
 
-async function loadPapers({ append = false } = {}) {
+async function loadPapers({ resetPage = false } = {}) {
+  if (resetPage) state.paperPage = 0;
   if (!['inbox', 'archive', 'collections'].includes(state.view)) return;
   if (state.view === 'collections' && !state.collectionId) {
     state.papers = [];
@@ -466,21 +557,26 @@ async function loadPapers({ append = false } = {}) {
   const requestId = ++state.paperLoadRequest;
   elements.paperList.classList.add('loading');
   try {
-    const offset = append ? state.papers.length : 0;
+    const offset = state.paperPage * PAPER_PAGE_SIZE;
     const payload = await api(`/api/papers?${currentPaperFilters({ offset })}`);
     if (requestId !== state.paperLoadRequest) return;
     const previousCategoryFilters = categoryFilterSignature();
     state.bootstrap.paperCategoryGroups = payload.paperCategoryGroups;
     renderPaperCategoryFilters();
-    if (!append && previousCategoryFilters !== categoryFilterSignature()) {
-      return loadPapers();
+    if (previousCategoryFilters !== categoryFilterSignature()) {
+      return loadPapers({ resetPage: true });
     }
     state.hasMorePapers = payload.papers.length > PAPER_PAGE_SIZE;
     const page = payload.papers.slice(0, PAPER_PAGE_SIZE);
-    state.papers = append ? [...state.papers, ...page] : page;
-    if (!append) state.selected.clear();
+    if (!page.length && state.paperPage > 0) {
+      state.paperPage -= 1;
+      return loadPapers();
+    }
+    state.papers = page;
+    state.selected.clear();
     updateStats(payload.stats);
     renderPapers();
+    state.latestSyncRunId = Number(payload.latestSyncRunId ?? state.latestSyncRunId);
   } catch (error) {
     if (requestId !== state.paperLoadRequest) return;
     toast(error.message, 'error');
@@ -516,6 +612,7 @@ function showPage(view) {
 
 async function navigate(view) {
   state.view = view;
+  state.paperPage = 0;
   state.selected.clear();
   if (['inbox', 'archive', 'collections'].includes(view)) {
     elements.sortFilter.value = view === 'inbox' ? 'updated' : 'activity';
@@ -538,6 +635,10 @@ async function navigate(view) {
 }
 
 function updateSelectionUi() {
+  const archiveHistory = state.view === 'archive';
+  elements.selectAll.disabled = archiveHistory;
+  elements.selectAll.closest('label').classList.toggle('hidden', archiveHistory);
+  if (archiveHistory) state.selected.clear();
   elements.batchBar.classList.toggle('hidden', state.selected.size === 0);
   elements.selectedCount.textContent = `${state.selected.size} selected`;
   elements.selectAll.checked = state.papers.length > 0 && state.selected.size === state.papers.length;
@@ -565,7 +666,14 @@ async function runSync(subscriptionId = null) {
   if (state.loading) return;
   setLoading(true);
   try {
-    const payload = await api('/api/sync', { method: 'POST', body: subscriptionId ? { subscriptionId } : {} });
+    const payload = await api('/api/sync', {
+      method: 'POST',
+      body: {
+        ...(subscriptionId ? { subscriptionId } : {}),
+        afterSyncRunId: state.latestSyncRunId,
+      },
+    });
+    const changes = payload.changesSince ?? payload;
     state.bootstrap.subscriptions = payload.subscriptions;
     state.bootstrap.paperCategoryGroups = payload.paperCategoryGroups;
     renderPaperCategoryFilters();
@@ -575,7 +683,8 @@ async function runSync(subscriptionId = null) {
     updateDueBanner();
     renderSubscriptions();
     if (['inbox', 'archive', 'collections'].includes(state.view)) await loadPapers();
-    toast(`${payload.newCount} new · ${payload.updatedCount} updated${payload.failedCount ? ` · ${payload.failedCount} failed` : ''}`, payload.failedCount ? 'error' : 'success');
+    state.latestSyncRunId = Number(payload.latestSyncRunId ?? state.latestSyncRunId);
+    toast(`${changes.newCount} new · ${changes.updatedCount} updated${changes.failedCount ? ` · ${changes.failedCount} failed` : ''}`, changes.failedCount ? 'error' : 'success');
   } catch (error) {
     toast(error.message, 'error');
   } finally {
@@ -596,6 +705,7 @@ async function addSubscription(event) {
     state.bootstrap.subscriptions = payload.subscriptions;
     state.bootstrap.paperCategoryGroups = payload.paperCategoryGroups;
     updateStats(payload.stats);
+    state.latestSyncRunId = Number(payload.sync.runId ?? state.latestSyncRunId);
     renderPaperCategoryFilters();
     renderSubscriptions();
     input.value = '';
@@ -612,13 +722,30 @@ async function createCollection(event) {
   event.preventDefault();
   const data = new FormData(event.currentTarget);
   try {
-    const payload = await api('/api/collections', { method: 'POST', body: { name: data.get('name') } });
+    const payload = await api('/api/collections', { method: 'POST', body: { name: data.get('name'), color: data.get('color') } });
     state.bootstrap.collections = payload.collections;
     state.collectionId = payload.collectionId;
     renderCollectionControls();
     renderCollectionsManager();
     await loadPapers();
     toast('Collection created');
+  } catch (error) { toast(error.message, 'error'); }
+}
+
+async function updateCurrentCollection(event) {
+  event.preventDefault();
+  const collection = state.bootstrap.collections.find((item) => Number(item.id) === Number(state.collectionId));
+  if (!collection) return;
+  const data = new FormData(event.currentTarget);
+  try {
+    const payload = await api(`/api/collections/${collection.id}`, {
+      method: 'PATCH', body: { color: data.get('color') },
+    });
+    state.bootstrap.collections = payload.collections;
+    renderCollectionControls();
+    renderCollectionsManager();
+    renderPapers();
+    toast('Collection color saved');
   } catch (error) { toast(error.message, 'error'); }
 }
 
@@ -658,16 +785,21 @@ function debounce(callback, wait) {
 document.querySelectorAll('.nav-item[data-view]').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.view)));
 elements.syncButton.addEventListener('click', () => runSync());
 document.querySelector('#due-sync-button').addEventListener('click', () => runSync());
-elements.loadMoreButton.addEventListener('click', async () => {
-  elements.loadMoreButton.disabled = true;
-  elements.loadMoreButton.textContent = 'Loading…';
-  await loadPapers({ append: true });
-  elements.loadMoreButton.disabled = false;
-  elements.loadMoreButton.textContent = 'Load 100 more';
+elements.previousPage.addEventListener('click', async () => {
+  if (state.paperPage === 0) return;
+  state.paperPage -= 1;
+  await loadPapers();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+elements.nextPage.addEventListener('click', async () => {
+  if (!state.hasMorePapers) return;
+  state.paperPage += 1;
+  await loadPapers();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 });
 document.querySelector('#add-subscription-form').addEventListener('submit', addSubscription);
 
-elements.search.addEventListener('input', debounce(loadPapers, 250));
+elements.search.addEventListener('input', debounce(() => loadPapers({ resetPage: true }), 250));
 elements.categoryFilterMenu.addEventListener('change', (event) => {
   const groupCode = event.target.dataset.categoryGroup;
   const categoryCode = event.target.dataset.categoryCode;
@@ -681,19 +813,20 @@ elements.categoryFilterMenu.addEventListener('change', (event) => {
     else state.selectedCategories.delete(categoryCode);
   } else return;
   renderPaperCategoryFilters();
-  loadPapers();
+  loadPapers({ resetPage: true });
 });
 elements.categoryFilterMenu.addEventListener('click', (event) => {
   if (!event.target.matches('[data-clear-categories]')) return;
   state.selectedCategoryGroups.clear();
   state.selectedCategories.clear();
   renderPaperCategoryFilters();
-  loadPapers();
+  loadPapers({ resetPage: true });
 });
 document.addEventListener('click', (event) => {
   if (!event.composedPath().includes(elements.categoryFilter)) elements.categoryFilter.open = false;
 });
-[elements.readFilter, elements.updatedFilter, elements.timeFilter, elements.sortFilter].forEach((element) => element.addEventListener('change', loadPapers));
+[elements.readFilter, elements.updatedFilter, elements.timeFilter, elements.sortFilter]
+  .forEach((element) => element.addEventListener('change', () => loadPapers({ resetPage: true })));
 
 elements.selectAll.addEventListener('change', () => {
   state.selected.clear();
@@ -706,6 +839,7 @@ elements.collectionStrip.addEventListener('click', async (event) => {
   const button = event.target.closest('[data-collection-id]');
   if (!button) return;
   state.collectionId = Number(button.dataset.collectionId);
+  state.paperPage = 0;
   renderCollectionControls();
   renderCollectionsManager();
   await loadPapers();
@@ -756,6 +890,7 @@ elements.paperList.addEventListener('click', async (event) => {
   const button = event.target.closest('[data-action]');
   if (!button) return;
   const action = button.dataset.action;
+  if (action === 'purgeArchive' && !window.confirm('删除这篇归档论文的全部本地内容、AI 结果和 Embedding？删除后该条目会从 Archive 消失；相同版本不会被 RSS 再次加入。')) return;
   if (action === 'ai-retry') {
     try {
       await api(`/api/papers/${encodeURIComponent(paperId)}/ai/retry`, { method: 'POST', body: {} });
@@ -784,6 +919,7 @@ elements.paperList.addEventListener('click', async (event) => {
   button.closest('.quick-collection')?.removeAttribute('open');
   const result = await paperAction(paperId, action, extra);
   if (!result) return;
+  if (action === 'purgeArchive') toast('本地内容已删除');
   if (isCollectionAction) {
     const payload = await api('/api/collections');
     state.bootstrap.collections = payload.collections;
@@ -866,6 +1002,8 @@ document.querySelector('#ai-settings-form').addEventListener('submit', async (ev
   if (button) button.disabled = true;
   try {
     const abstractDisplayMode = document.querySelector('#abstract-display-mode').value;
+    const apiKey = document.querySelector('#ai-api-key').value.trim();
+    const clearApiKey = document.querySelector('#ai-clear-api-key').checked;
     const payload = await api('/api/ai/config', {
       method: 'PATCH',
       body: {
@@ -874,11 +1012,15 @@ document.querySelector('#ai-settings-form').addEventListener('submit', async (ev
         model: document.querySelector('#ai-model').value,
         maxConcurrency: Number(document.querySelector('#ai-concurrency').value),
         abstractDisplayMode,
+        ...(apiKey ? { apiKey } : {}),
+        clearApiKey,
       },
     });
     state.bootstrap.ai = payload;
     state.bootstrap.settings.ai_processing_mode = payload.mode;
     state.bootstrap.settings.abstract_display_mode = abstractDisplayMode;
+    document.querySelector('#ai-api-key').value = '';
+    document.querySelector('#ai-clear-api-key').checked = false;
     updateAiStatusText(payload);
     updateSelectionUi();
     renderPapers();
@@ -893,13 +1035,84 @@ document.querySelector('#test-ai').addEventListener('click', async (event) => {
   event.target.disabled = true;
   event.target.textContent = 'Testing…';
   try {
+    const apiKey = document.querySelector('#ai-api-key').value.trim();
     const result = await api('/api/ai/test', { method: 'POST', body: {
       baseUrl: document.querySelector('#ai-base-url').value,
       model: document.querySelector('#ai-model').value,
+      ...(apiKey ? { apiKey } : {}),
     } });
     toast(`AI connected in ${result.latencyMs} ms`);
   } catch (error) { toast(error.message, 'error'); }
   finally { event.target.disabled = false; event.target.textContent = 'Test connection'; }
+});
+document.querySelector('#embedding-settings-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.submitter;
+  if (button) button.disabled = true;
+  try {
+    const apiKey = document.querySelector('#embedding-api-key').value.trim();
+    const payload = await api('/api/embeddings/config', {
+      method: 'PATCH',
+      body: {
+        mode: document.querySelector('#embedding-mode').value,
+        baseUrl: document.querySelector('#embedding-base-url').value,
+        model: document.querySelector('#embedding-model').value,
+        batchSize: Number(document.querySelector('#embedding-batch-size').value),
+        threshold: Number(document.querySelector('#classification-threshold').value),
+        margin: Number(document.querySelector('#classification-margin').value),
+        archiveColor: document.querySelector('#archive-color').value,
+        ...(apiKey ? { apiKey } : {}),
+        clearApiKey: document.querySelector('#embedding-clear-api-key').checked,
+      },
+    });
+    state.bootstrap.embeddings = payload;
+    state.bootstrap.settings.archive_color = payload.archiveColor;
+    document.querySelector('#embedding-api-key').value = '';
+    document.querySelector('#embedding-clear-api-key').checked = false;
+    updateEmbeddingStatusText(payload);
+    renderPapers();
+    ensureEmbeddingPolling();
+    toast(payload.reset ? 'Embedding settings saved · all vectors queued for regeneration' : 'Embedding settings saved');
+  } catch (error) { toast(error.message, 'error'); }
+  finally { if (button) button.disabled = false; }
+});
+document.querySelector('#test-embedding').addEventListener('click', async (event) => {
+  event.target.disabled = true;
+  event.target.textContent = 'Testing…';
+  try {
+    const apiKey = document.querySelector('#embedding-api-key').value.trim();
+    const result = await api('/api/embeddings/test', { method: 'POST', body: {
+      baseUrl: document.querySelector('#embedding-base-url').value,
+      model: document.querySelector('#embedding-model').value,
+      ...(apiKey ? { apiKey } : {}),
+    } });
+    toast(`Embedding connected in ${result.latencyMs} ms · ${result.dimensions} dimensions`);
+  } catch (error) { toast(error.message, 'error'); }
+  finally { event.target.disabled = false; event.target.textContent = 'Test connection'; }
+});
+elements.retryFailedEmbeddings.addEventListener('click', async (event) => {
+  event.currentTarget.disabled = true;
+  try {
+    const payload = await api('/api/embeddings/retry-failed', { method: 'POST', body: {} });
+    state.bootstrap.embeddings = payload.status;
+    updateEmbeddingStatusText(payload.status);
+    ensureEmbeddingPolling();
+    toast(payload.queued ? `已重新排队 ${payload.queued} 篇论文` : '当前没有失败的 Embedding');
+  } catch (error) { toast(error.message, 'error'); }
+  finally { updateEmbeddingStatusText(state.bootstrap.embeddings); }
+});
+elements.retryFailedAi.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const payload = await api('/api/ai/retry-failed', { method: 'POST', body: {} });
+    state.bootstrap.ai = payload.status;
+    for (const paper of state.papers) if (paper.ai_status === 'failed') paper.ai_status = 'pending';
+    renderPapers();
+    updateAiStatusText(payload.status);
+    toast(payload.queued ? `已重新排队 ${payload.queued} 篇失败论文` : '当前没有失败论文');
+  } catch (error) { toast(error.message, 'error'); }
+  finally { updateAiStatusText(state.bootstrap.ai); }
 });
 document.querySelector('#refresh-categories').addEventListener('click', async (event) => {
   event.target.disabled = true;
@@ -918,6 +1131,7 @@ document.querySelector('#restore-input').addEventListener('change', (event) => r
 async function boot() {
   try {
     state.bootstrap = await api('/api/bootstrap');
+    state.latestSyncRunId = Number(state.bootstrap.latestSyncRunId ?? 0);
     updateStats(state.bootstrap.stats);
     renderCategoryOptions();
     renderPaperCategoryFilters();
@@ -934,6 +1148,16 @@ async function boot() {
     document.querySelector('#ai-concurrency').value = state.bootstrap.ai.maxConcurrency;
     document.querySelector('#abstract-display-mode').value = state.bootstrap.ai.abstractDisplayMode;
     updateAiStatusText(state.bootstrap.ai);
+    document.querySelector('#ai-api-key').placeholder = state.bootstrap.ai.apiKeyConfigured ? '已保存密钥；留空保持不变' : '可留空（服务无需密钥）';
+    document.querySelector('#embedding-mode').value = state.bootstrap.embeddings.mode;
+    document.querySelector('#embedding-base-url').value = state.bootstrap.embeddings.baseUrl;
+    document.querySelector('#embedding-model').value = state.bootstrap.embeddings.model;
+    document.querySelector('#embedding-batch-size').value = state.bootstrap.embeddings.batchSize;
+    document.querySelector('#classification-threshold').value = state.bootstrap.embeddings.threshold;
+    document.querySelector('#classification-margin').value = state.bootstrap.embeddings.margin;
+    document.querySelector('#archive-color').value = safeColor(state.bootstrap.embeddings.archiveColor);
+    document.querySelector('#embedding-api-key').placeholder = state.bootstrap.embeddings.apiKeyConfigured ? '已保存密钥；留空保持不变' : '可留空（服务无需密钥）';
+    updateEmbeddingStatusText(state.bootstrap.embeddings);
     await navigate('inbox');
     if (state.bootstrap.categoriesNeedRefresh) {
       api('/api/categories/refresh', { method: 'POST' }).then((payload) => {

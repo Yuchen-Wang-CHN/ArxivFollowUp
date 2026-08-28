@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDatabase } from '../src/db.js';
+import { createDatabase, getSecret } from '../src/db.js';
 import { createApp } from '../src/server.js';
-import { ingestFeed } from '../src/sync.js';
+import { ingestFeed, syncSubscriptions } from '../src/sync.js';
 
 test('serves bootstrap and validates local mutation header', async (context) => {
   const db = createDatabase(':memory:');
@@ -63,6 +63,53 @@ test('paper API accepts repeated category and category-group filters', async (co
   const mixedResponse = await fetch(`http://127.0.0.1:${port}/api/papers?categoryGroup=stat&category=math.OC`);
   assert.equal(mixedResponse.status, 200);
   assert.deepEqual((await mixedResponse.json()).papers.map((item) => item.id).sort(), ['2608.00002', '2608.00003']);
+});
+
+test('sync API reports changes from a background run unseen by the page', async (context) => {
+  const db = createDatabase(':memory:');
+  const now = '2026-08-20T00:00:00.000Z';
+  const inserted = db.prepare("INSERT INTO subscriptions (category, created_at) VALUES ('cs.AI', ?)").run(now);
+  const subscription = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(Number(inserted.lastInsertRowid));
+  const paper = {
+    id: '2608.00001', version: 1, title: 'Background paper', authors: 'Author', abstract: 'Abstract',
+    categories: ['cs.AI'], announcedAt: now, arxivUrl: 'https://arxiv.org/abs/2608.00001',
+    pdfUrl: 'https://arxiv.org/pdf/2608.00001', announceType: 'new',
+  };
+
+  const background = await syncSubscriptions(db, [subscription], {
+    fetchFeed: async () => ({ papers: [paper], errors: [] }),
+    fetchMetadata: async () => [],
+  });
+  assert.equal(background.newCount, 1);
+
+  const app = createApp({
+    db,
+    port: 0,
+    syncOptions: {
+      fetchFeed: async () => ({ papers: [paper], errors: [] }),
+      fetchMetadata: async () => [],
+    },
+  });
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  context.after(() => { app.server.close(); db.close(); });
+  const { port } = app.server.address();
+  const response = await fetch(`http://127.0.0.1:${port}/api/sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' },
+    body: JSON.stringify({ afterSyncRunId: 0 }),
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.newCount, 0);
+  assert.equal(payload.updatedCount, 0);
+  assert.deepEqual(payload.changesSince, {
+    runCount: 2,
+    newCount: 1,
+    updatedCount: 0,
+    failedCount: 0,
+    latestSyncRunId: payload.runId,
+  });
 });
 
 test('adding a paper to a collection removes it from Inbox', async (context) => {
@@ -129,6 +176,78 @@ test('adding a paper to a collection removes it from Inbox', async (context) => 
   });
 });
 
+test('archiving preserves local content until explicit deletion, then suppresses the same RSS version', async (context) => {
+  const db = createDatabase(':memory:');
+  const now = '2026-08-20T00:00:00.000Z';
+  const inserted = db.prepare("INSERT INTO subscriptions (category, created_at) VALUES ('cs.AI', ?)").run(now);
+  const subscription = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(Number(inserted.lastInsertRowid));
+  const paper = {
+    id: '2608.02001', version: 1, title: 'Disposable paper', authors: 'Author', abstract: 'Abstract',
+    categories: ['cs.AI'], announcedAt: now, arxivUrl: 'https://arxiv.org/abs/2608.02001',
+    pdfUrl: 'https://arxiv.org/pdf/2608.02001', announceType: 'new',
+  };
+  ingestFeed(db, subscription, { errors: [], papers: [paper] }, now);
+  db.prepare(`
+    INSERT INTO paper_ai_analyses (paper_id, paper_version, source_hash, status, trigger, queued_at)
+    VALUES (?, 1, 'hash', 'succeeded', 'manual', ?)
+  `).run(paper.id, now);
+  db.prepare(`
+    INSERT INTO paper_embeddings (paper_id, paper_version, source_hash, status, vector, dimensions, model, queued_at)
+    VALUES (?, 1, 'hash', 'succeeded', ?, 2, 'embedding-model', ?)
+  `).run(paper.id, Buffer.from(new Float32Array([1, 0]).buffer), now);
+
+  const app = createApp({ db, port: 0 });
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  context.after(() => { app.server.close(); db.close(); });
+  const { port } = app.server.address();
+  const archived = await fetch(`http://127.0.0.1:${port}/api/papers/${paper.id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' },
+    body: JSON.stringify({ action: 'archive' }),
+  });
+
+  assert.equal(archived.status, 200);
+  assert.equal((await archived.json()).stats.archived, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM papers').get().count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM paper_ai_analyses').get().count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM paper_embeddings').get().count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM archived_paper_tombstones').get().count, 0);
+  const archivePayload = await (await fetch(`http://127.0.0.1:${port}/api/papers?view=archive`)).json();
+  assert.equal(archivePayload.papers[0].id, paper.id);
+  assert.equal(archivePayload.papers[0].abstract, 'Abstract');
+
+  const purged = await fetch(`http://127.0.0.1:${port}/api/papers/${paper.id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' },
+    body: JSON.stringify({ action: 'purgeArchive' }),
+  });
+  assert.equal(purged.status, 200);
+  assert.equal((await purged.json()).stats.archived, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM papers').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM paper_ai_analyses').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM paper_embeddings').get().count, 0);
+  assert.deepEqual({ ...db.prepare('SELECT * FROM archived_paper_tombstones').get() }, {
+    paper_id: paper.id, archived_version: 1, archived_at: db.prepare('SELECT archived_at FROM archived_paper_tombstones').get().archived_at,
+  });
+  const emptyArchive = await (await fetch(`http://127.0.0.1:${port}/api/papers?view=archive`)).json();
+  assert.deepEqual(emptyArchive.papers, []);
+
+  const duplicate = ingestFeed(db, subscription, { errors: [], papers: [paper] }, '2026-08-21T00:00:00.000Z');
+  assert.equal(duplicate.newIds.size, 0);
+  assert.equal(duplicate.updatedIds.size, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM papers').get().count, 0);
+
+  const update = ingestFeed(db, subscription, { errors: [], papers: [{
+    ...paper, version: 2, title: 'Disposable paper v2', abstract: 'Updated abstract', announceType: 'replace',
+  }] }, '2026-08-22T00:00:00.000Z');
+  assert.deepEqual([...update.updatedIds], [paper.id]);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM archived_paper_tombstones').get().count, 0);
+  assert.deepEqual({ ...db.prepare('SELECT latest_version FROM papers WHERE id = ?').get(paper.id) }, { latest_version: 2 });
+  assert.deepEqual({ ...db.prepare('SELECT unread_reason, in_inbox FROM user_paper_states WHERE paper_id = ?').get(paper.id) }, {
+    unread_reason: 'updated', in_inbox: 1,
+  });
+});
+
 test('AI configuration and manual batch endpoints validate mode and queue selected papers', async (context) => {
   const db = createDatabase(':memory:');
   const now = '2026-08-20T00:00:00.000Z';
@@ -152,14 +271,82 @@ test('AI configuration and manual batch endpoints validate mode and queue select
   assert.equal(blocked.status, 409);
 
   const configured = await fetch(`http://127.0.0.1:${port}/api/ai/config`, {
-    method: 'PATCH', headers, body: JSON.stringify({ mode: 'manual', maxConcurrency: 10, abstractDisplayMode: 'bilingual' }),
+    method: 'PATCH', headers, body: JSON.stringify({ mode: 'manual', maxConcurrency: 25, abstractDisplayMode: 'bilingual' }),
   });
   assert.equal(configured.status, 200);
-  assert.equal((await configured.json()).mode, 'manual');
+  const configuration = await configured.json();
+  assert.equal(configuration.mode, 'manual');
+  assert.equal(configuration.maxConcurrency, 25);
 
   const queued = await fetch(`http://127.0.0.1:${port}/api/ai/papers/batch`, {
     method: 'POST', headers, body: JSON.stringify({ paperIds: ['2608.00001'] }),
   });
   assert.equal(queued.status, 202);
   assert.equal((await queued.json()).queued, 1);
+});
+
+test('LLM and Embedding API keys are stored locally without being returned by bootstrap', async (context) => {
+  const db = createDatabase(':memory:');
+  const app = createApp({ db, port: 0 });
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  context.after(() => { app.server.close(); db.close(); });
+  const { port } = app.server.address();
+  const headers = { 'Content-Type': 'application/json', 'X-AFU-Request': '1' };
+
+  const llm = await fetch(`http://127.0.0.1:${port}/api/ai/config`, {
+    method: 'PATCH', headers, body: JSON.stringify({ apiKey: 'llm-local-secret' }),
+  });
+  const embedding = await fetch(`http://127.0.0.1:${port}/api/embeddings/config`, {
+    method: 'PATCH', headers, body: JSON.stringify({ apiKey: 'embedding-local-secret', archiveColor: '#334155' }),
+  });
+  const bootstrap = await (await fetch(`http://127.0.0.1:${port}/api/bootstrap`)).json();
+
+  assert.equal(llm.status, 200);
+  assert.equal(embedding.status, 200);
+  assert.equal(getSecret(db, 'ai_api_key'), 'llm-local-secret');
+  assert.equal(getSecret(db, 'embedding_api_key'), 'embedding-local-secret');
+  assert.equal(bootstrap.ai.apiKeyConfigured, true);
+  assert.equal(bootstrap.embeddings.apiKeyConfigured, true);
+  assert.equal(bootstrap.embeddings.archiveColor, '#334155');
+  assert.equal(JSON.stringify(bootstrap).includes('local-secret'), false);
+});
+
+test('AI retry-failed endpoint requeues every failed analysis', async (context) => {
+  const db = createDatabase(':memory:');
+  const now = '2026-08-20T00:00:00.000Z';
+  const inserted = db.prepare("INSERT INTO subscriptions (category, created_at) VALUES ('cs.AI', ?)").run(now);
+  const subscription = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(Number(inserted.lastInsertRowid));
+  ingestFeed(db, subscription, { errors: [], papers: ['1', '2'].map((suffix) => ({
+    id: `2608.1000${suffix}`, version: 1, title: `Failed paper ${suffix}`, authors: 'Author', abstract: 'Abstract',
+    categories: ['cs.AI'], announcedAt: now, arxivUrl: `https://arxiv.org/abs/2608.1000${suffix}`,
+    pdfUrl: `https://arxiv.org/pdf/2608.1000${suffix}`, announceType: 'new',
+  })) }, now);
+  db.prepare(`
+    INSERT INTO paper_ai_analyses (paper_id, paper_version, source_hash, status, trigger, queued_at, last_error, attempt_count)
+    VALUES (?, 1, 'hash', 'failed', 'manual', ?, 'provider error', 3)
+  `).run('2608.10001', now);
+  db.prepare(`
+    INSERT INTO paper_ai_analyses (paper_id, paper_version, source_hash, status, trigger, queued_at, last_error, attempt_count)
+    VALUES (?, 1, 'hash', 'failed', 'auto', ?, 'timeout', 3)
+  `).run('2608.10002', now);
+
+  const app = createApp({ db, port: 0 });
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  context.after(() => { app.server.close(); db.close(); });
+  const { port } = app.server.address();
+  const request = () => fetch(`http://127.0.0.1:${port}/api/ai/retry-failed`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' }, body: '{}',
+  });
+
+  assert.equal((await request()).status, 409);
+  db.prepare("UPDATE settings SET value = 'manual' WHERE key = 'ai_processing_mode'").run();
+  const response = await request();
+  const payload = await response.json();
+  assert.equal(response.status, 202);
+  assert.equal(payload.queued, 2);
+  assert.equal(payload.status.pending, 2);
+  assert.equal(payload.status.failed, 0);
+  assert.deepEqual(db.prepare(`
+    SELECT DISTINCT status, trigger, priority, last_error, attempt_count FROM paper_ai_analyses ORDER BY status
+  `).all().map((row) => ({ ...row })), [{ status: 'pending', trigger: 'manual', priority: 100, last_error: null, attempt_count: 0 }]);
 });

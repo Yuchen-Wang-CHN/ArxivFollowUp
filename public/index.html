@@ -103,8 +103,10 @@
         </div>
 
         <div class="paper-list" id="paper-list"></div>
-        <div class="load-more-wrap hidden" id="load-more-wrap">
-          <button class="button secondary" id="load-more-button">Load 100 more</button>
+        <div class="pagination hidden" id="pagination">
+          <button class="button secondary" id="previous-page">← Previous</button>
+          <span id="page-label">Page 1</span>
+          <button class="button secondary" id="next-page">Next →</button>
         </div>
       </section>
 
@@ -143,8 +145,8 @@
             <select id="display-density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select>
           </article>
           <article class="settings-card ai-settings-card">
-            <h3>AI processing</h3>
-            <p>使用独立请求滚动处理论文；每个请求只包含一篇论文。</p>
+            <h3>LLM analysis</h3>
+            <p>生成中文摘要与一句话解读。LLM 与 Embedding 使用互相独立的 API。</p>
             <form id="ai-settings-form" class="ai-settings-form">
               <label>Mode
                 <select id="ai-mode">
@@ -154,16 +156,51 @@
                 </select>
               </label>
               <label>Base URL<input id="ai-base-url" type="url" required></label>
+              <label>API key
+                <input id="ai-api-key" type="password" autocomplete="off" placeholder="留空则保持现有密钥">
+              </label>
+              <label class="checkbox-setting"><input id="ai-clear-api-key" type="checkbox"> 清除已保存的 LLM API key</label>
               <label>Model<input id="ai-model" required></label>
               <label>Maximum concurrent requests
-                <input id="ai-concurrency" type="number" min="1" max="10" required>
+                <input id="ai-concurrency" type="number" min="1" step="1" required>
               </label>
               <div class="button-row">
                 <button class="button" type="submit">Save AI settings</button>
                 <button class="button secondary" id="test-ai" type="button">Test connection</button>
+                <button class="button secondary" id="retry-failed-ai" type="button">重试所有失败论文</button>
               </div>
             </form>
             <p class="ai-service-status" id="ai-service-status"></p>
+          </article>
+          <article class="settings-card ai-settings-card">
+            <h3>Embedding & classification</h3>
+            <p>为当前保留的论文生成向量，并根据 Collection 样本预测默认类别。Archive 不参与相似度计算。</p>
+            <form id="embedding-settings-form" class="ai-settings-form">
+              <label>Mode
+                <select id="embedding-mode">
+                  <option value="off">关闭</option>
+                  <option value="auto">自动嵌入并分类保留的论文</option>
+                </select>
+              </label>
+              <label>Base URL<input id="embedding-base-url" type="url" required></label>
+              <label>API key
+                <input id="embedding-api-key" type="password" autocomplete="off" placeholder="留空则保持现有密钥">
+              </label>
+              <label class="checkbox-setting"><input id="embedding-clear-api-key" type="checkbox"> 清除已保存的 Embedding API key</label>
+              <label>Model<input id="embedding-model" required></label>
+              <label>Batch size<input id="embedding-batch-size" type="number" min="1" max="256" step="1" required></label>
+              <div class="settings-inline-fields">
+                <label>Classification threshold<input id="classification-threshold" type="number" min="-1" max="1" step="0.01" required></label>
+                <label>Winning margin<input id="classification-margin" type="number" min="0" max="2" step="0.01" required></label>
+                <label>Archive color<input id="archive-color" type="color" required></label>
+              </div>
+              <div class="button-row">
+                <button class="button" type="submit">Save embedding settings</button>
+                <button class="button secondary" id="test-embedding" type="button">Test connection</button>
+                <button class="button secondary" id="retry-failed-embeddings" type="button">重试失败的 Embedding</button>
+              </div>
+            </form>
+            <p class="ai-service-status" id="embedding-service-status"></p>
           </article>
           <article class="settings-card">
             <h3>Abstract display</h3>

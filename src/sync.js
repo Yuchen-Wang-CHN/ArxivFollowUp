@@ -15,6 +15,10 @@ export function ingestFeed(db, subscription, feed, now = new Date().toISOString(
 
   transaction(db, () => {
     for (const item of feed.papers) {
+      const tombstone = db.prepare('SELECT * FROM archived_paper_tombstones WHERE paper_id = ?').get(item.id);
+      if (tombstone && item.version <= tombstone.archived_version) continue;
+      const restoredFromArchive = Boolean(tombstone && item.version > tombstone.archived_version);
+      if (restoredFromArchive) db.prepare('DELETE FROM archived_paper_tombstones WHERE paper_id = ?').run(item.id);
       const existing = db.prepare('SELECT * FROM papers WHERE id = ?').get(item.id);
       const itemCategories = [...new Set([...item.categories, subscription.category])].sort();
       const categoriesJson = JSON.stringify(itemCategories);
@@ -30,9 +34,10 @@ export function ingestFeed(db, subscription, feed, now = new Date().toISOString(
         db.prepare(`
           INSERT INTO user_paper_states (
             paper_id, is_read, unread_reason, in_inbox, inbox_activity_at
-          ) VALUES (?, 0, 'new', 1, ?)
-        `).run(item.id, now);
-        added.add(item.id);
+          ) VALUES (?, 0, ?, 1, ?)
+        `).run(item.id, restoredFromArchive ? 'updated' : 'new', now);
+        if (restoredFromArchive) updated.add(item.id);
+        else added.add(item.id);
       } else if (item.version > existing.latest_version) {
         const mergedCategories = mergeCategories(existing.categories_json, itemCategories);
         db.prepare(`
@@ -45,13 +50,15 @@ export function ingestFeed(db, subscription, feed, now = new Date().toISOString(
         db.prepare(`
           UPDATE user_paper_states SET
             is_read = 0,
-            unread_reason = CASE WHEN is_read = 1 THEN 'updated' ELSE unread_reason END,
+            unread_reason = CASE WHEN archived_at IS NOT NULL OR is_read = 1 THEN 'updated' ELSE unread_reason END,
             read_at = NULL,
             in_inbox = CASE
               WHEN EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = user_paper_states.paper_id) THEN 0
               ELSE 1
             END,
-            inbox_activity_at = ?
+            inbox_activity_at = ?,
+            archived_version = NULL,
+            archived_at = NULL
           WHERE paper_id = ?
         `).run(now, item.id);
         if (state) updated.add(item.id);
@@ -194,7 +201,16 @@ export function syncSubscriptions(db, subscriptions, options = {}) {
         UPDATE sync_runs SET finished_at = ?, status = ?, new_count = ?, updated_count = ?, failed_count = ?
         WHERE id = ?
       `).run(new Date().toISOString(), status, newIds.size, updatedIds.size, failedCount, Number(run.lastInsertRowid));
-      return { status, newCount: newIds.size, updatedCount: updatedIds.size, failedCount, metadata, ai, results };
+      return {
+        runId: Number(run.lastInsertRowid),
+        status,
+        newCount: newIds.size,
+        updatedCount: updatedIds.size,
+        failedCount,
+        metadata,
+        ai,
+        results,
+      };
     } catch (error) {
       db.prepare("UPDATE sync_runs SET finished_at = ?, status = 'error', error = ? WHERE id = ?")
         .run(new Date().toISOString(), error.message, Number(run.lastInsertRowid));

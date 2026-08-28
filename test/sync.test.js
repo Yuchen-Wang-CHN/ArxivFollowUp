@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createDatabase, exportBackup, getAiQueueStatus, getSettings, getStats, listInboxCategoryGroups, listPapers, restoreBackup, setSetting } from '../src/db.js';
+import { createDatabase, exportBackup, getAiQueueStatus, getLatestCompletedSyncRunId, getSettings, getStats, getSyncChangesSince, listInboxCategoryGroups, listPapers, restoreBackup, setSetting } from '../src/db.js';
 import { enrichPaperDates, ingestFeed, syncSubscriptions } from '../src/sync.js';
 
 function setup() {
@@ -40,12 +40,14 @@ test('sync is idempotent and versions only move forward', () => {
   assert.deepEqual({ ...db.prepare('SELECT is_read, unread_reason, in_inbox FROM user_paper_states').get() }, { is_read: 0, unread_reason: 'updated', in_inbox: 1 });
   assert.equal(getStats(db).unread, 1);
 
-  db.prepare("UPDATE user_paper_states SET in_inbox = 0, archived_version = 2 WHERE paper_id = '2508.12345'").run();
+  db.prepare("UPDATE user_paper_states SET in_inbox = 0, archived_version = 2, archived_at = '2026-08-22T06:00:00.000Z' WHERE paper_id = '2508.12345'").run();
   ingestFeed(db, subscription, { papers: [item(2)], errors: [] }, '2026-08-23T05:00:00.000Z');
   assert.equal(db.prepare('SELECT in_inbox FROM user_paper_states').get().in_inbox, 0);
 
   ingestFeed(db, subscription, { papers: [item(3)], errors: [] }, '2026-08-24T05:00:00.000Z');
-  assert.equal(db.prepare('SELECT in_inbox FROM user_paper_states').get().in_inbox, 1);
+  assert.deepEqual({ ...db.prepare('SELECT in_inbox, unread_reason, archived_version, archived_at FROM user_paper_states').get() }, {
+    in_inbox: 1, unread_reason: 'updated', archived_version: null, archived_at: null,
+  });
   ingestFeed(db, subscription, { papers: [item(2)], errors: [] }, '2026-08-25T05:00:00.000Z');
   assert.equal(db.prepare('SELECT latest_version FROM papers').get().latest_version, 3);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM paper_versions').get().count, 3);
@@ -164,6 +166,40 @@ test('auto AI mode queues newly synchronized papers without blocking sync', asyn
   assert.equal(result.status, 'success');
   assert.equal(result.ai.queued, 1);
   assert.equal(getAiQueueStatus(db).pending, 1);
+  db.close();
+});
+
+test('sync changes can be summarized across unseen background runs', async () => {
+  const { db, subscription } = setup();
+  const first = await syncSubscriptions(db, [subscription], {
+    fetchFeed: async () => ({ papers: [item(1)], errors: [] }),
+    fetchMetadata: async () => [],
+  });
+  const second = await syncSubscriptions(db, [subscription], {
+    fetchFeed: async () => ({ papers: [
+      item(2),
+      item(1, { id: '2508.54321', title: 'Another paper' }),
+    ], errors: [] }),
+    fetchMetadata: async () => [],
+  });
+
+  assert.equal(first.runId, 1);
+  assert.equal(second.runId, 2);
+  assert.equal(getLatestCompletedSyncRunId(db), 2);
+  assert.deepEqual(getSyncChangesSince(db, 0, second.runId), {
+    runCount: 2,
+    newCount: 2,
+    updatedCount: 1,
+    failedCount: 0,
+    latestSyncRunId: 2,
+  });
+  assert.deepEqual(getSyncChangesSince(db, first.runId, second.runId), {
+    runCount: 1,
+    newCount: 1,
+    updatedCount: 1,
+    failedCount: 0,
+    latestSyncRunId: 2,
+  });
   db.close();
 });
 

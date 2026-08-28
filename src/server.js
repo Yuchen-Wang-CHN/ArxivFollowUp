@@ -4,23 +4,34 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createDatabase,
+  enqueueFailedPaperAnalyses,
   enqueuePaperAnalyses,
   enqueueUnprocessedInboxAnalyses,
   exportBackup,
   getAiQueueStatus,
+  getLatestCompletedSyncRunId,
   getPaperAiAnalysis,
   getSettings,
   getStats,
+  getSyncChangesSince,
   listCollections,
   listInboxCategoryGroups,
   listPapers,
   listPaperAiResults,
   listSubscriptions,
   restoreBackup,
+  setSecret,
   setSetting,
   transaction,
 } from './db.js';
 import { createAiCoordinator, getAiConfiguration, testAiConnection } from './ai.js';
+import {
+  createEmbeddingCoordinator,
+  enqueueFailedPaperEmbeddings,
+  getEmbeddingConfiguration,
+  getEmbeddingQueueStatus,
+  testEmbeddingConnection,
+} from './embeddings.js';
 import { fetchCategoryTaxonomy, getFallbackCategories } from './arxiv.js';
 import { HOST, KATEX_DIRECTORY, PORT, PUBLIC_DIRECTORY } from './config.js';
 import { dueSubscriptions, enrichPaperDates, syncSubscriptions } from './sync.js';
@@ -87,6 +98,24 @@ function normalizeCategory(category) {
   return value;
 }
 
+function normalizeServiceUrl(value, label) {
+  let parsed;
+  try { parsed = new URL(String(value ?? '').trim()); } catch { throw Object.assign(new Error(`Invalid ${label} Base URL.`), { statusCode: 400 }); }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw Object.assign(new Error(`${label} Base URL must use http or https.`), { statusCode: 400 });
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function normalizeColor(value) {
+  const color = String(value ?? '').trim().toLowerCase();
+  if (!/^#[0-9a-f]{6}$/.test(color)) throw Object.assign(new Error('Color must be a six-digit hex value.'), { statusCode: 400 });
+  return color;
+}
+
+function updateApiKey(db, secretName, payload) {
+  if (payload.clearApiKey === true) setSecret(db, secretName, '');
+  else if (payload.apiKey != null && String(payload.apiKey).trim()) setSecret(db, secretName, payload.apiKey);
+}
+
 function getCategoryCache(db) {
   return db.prepare(`
     SELECT code, name, group_code AS groupCode, group_name AS groupName, refreshed_at AS refreshedAt
@@ -142,9 +171,26 @@ function changePaperState(db, paperId, action, options = {}) {
   } else if (action === 'unread') {
     db.prepare("UPDATE user_paper_states SET is_read = 0, unread_reason = 'manual', read_at = NULL WHERE paper_id = ?").run(paperId);
   } else if (action === 'archive') {
+    const collectionCount = Number(db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count);
+    db.prepare('DELETE FROM paper_collections WHERE paper_id = ?').run(paperId);
     db.prepare(`
-      UPDATE user_paper_states SET in_inbox = 0, archived_version = ?, archived_at = ? WHERE paper_id = ?
+      UPDATE user_paper_states SET in_inbox = 0, archived_version = ?, archived_at = ?
+      WHERE paper_id = ?
     `).run(paper.latest_version, now, paperId);
+    return { classificationChanged: collectionCount > 0 };
+  } else if (action === 'purgeArchive') {
+    if (paper.in_inbox || !paper.archived_at) {
+      throw Object.assign(new Error('Only archived papers can have their local content deleted.'), { statusCode: 409 });
+    }
+    db.prepare(`
+      INSERT INTO archived_paper_tombstones (paper_id, archived_version, archived_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(paper_id) DO UPDATE SET
+        archived_version = MAX(archived_version, excluded.archived_version),
+        archived_at = excluded.archived_at
+    `).run(paperId, paper.archived_version ?? paper.latest_version, paper.archived_at);
+    db.prepare('DELETE FROM papers WHERE id = ?').run(paperId);
+    return { classificationChanged: false };
   } else if (action === 'inbox') {
     const collectionCount = db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count;
     if (collectionCount) throw Object.assign(new Error('Remove the paper from all collections before moving it to Inbox.'), { statusCode: 409 });
@@ -152,6 +198,7 @@ function changePaperState(db, paperId, action, options = {}) {
       UPDATE user_paper_states SET in_inbox = 1, inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
       WHERE paper_id = ?
     `).run(now, paperId);
+    return { classificationChanged: true };
   } else if (action === 'addToCollection') {
     const collectionId = Number(options.collectionId);
     const collection = db.prepare('SELECT id FROM collections WHERE id = ?').get(collectionId);
@@ -159,7 +206,10 @@ function changePaperState(db, paperId, action, options = {}) {
     db.prepare(`
       INSERT OR IGNORE INTO paper_collections (paper_id, collection_id, added_at) VALUES (?, ?, ?)
     `).run(paperId, collectionId, now);
-    db.prepare('UPDATE user_paper_states SET in_inbox = 0 WHERE paper_id = ?').run(paperId);
+    db.prepare(`
+      UPDATE user_paper_states SET in_inbox = 0, archived_version = NULL, archived_at = NULL WHERE paper_id = ?
+    `).run(paperId);
+    return { classificationChanged: true };
   } else if (action === 'removeFromCollection') {
     const collectionId = Number(options.collectionId);
     const collection = db.prepare('SELECT id FROM collections WHERE id = ?').get(collectionId);
@@ -172,9 +222,11 @@ function changePaperState(db, paperId, action, options = {}) {
         WHERE paper_id = ?
       `).run(now, paperId);
     }
+    return { classificationChanged: true };
   } else {
     throw Object.assign(new Error('Unknown paper action.'), { statusCode: 400 });
   }
+  return { classificationChanged: false };
 }
 
 function serveStatic(response, pathname) {
@@ -203,16 +255,30 @@ function serveStatic(response, pathname) {
   response.end(content);
 }
 
-export function createApp({ db = createDatabase(), port = PORT, startAiWorker = false } = {}) {
+export function createApp({
+  db = createDatabase(),
+  port = PORT,
+  startAiWorker = false,
+  startEmbeddingWorker = startAiWorker,
+  syncOptions = {},
+  embeddingOptions = {},
+} = {}) {
   const ai = startAiWorker
     ? createAiCoordinator(db)
     : { kick() {}, configurationChanged() {}, stop() {}, status: () => ({ ...getAiQueueStatus(db), active: 0, blockedError: null, ...getAiConfiguration(db) }) };
+  const embeddings = startEmbeddingWorker
+    ? createEmbeddingCoordinator(db, embeddingOptions)
+    : {
+        kick() {}, configurationChanged() {}, classificationChanged() {}, stop() {},
+        status: () => ({ ...getEmbeddingQueueStatus(db), active: 0, blockedError: null, ...getEmbeddingConfiguration(db) }),
+      };
   let server;
   let shutdownStarted = false;
   const shutdown = ({ exitProcess = false } = {}) => {
     if (shutdownStarted) return;
     shutdownStarted = true;
     ai.stop();
+    embeddings.stop();
     let finished = false;
     const finish = () => {
       if (finished) return;
@@ -240,7 +306,9 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
           paperCategoryGroups: listInboxCategoryGroups(db),
           categoriesNeedRefresh: categories.length === 0,
           dueSubscriptionCount: due.length,
+          latestSyncRunId: getLatestCompletedSyncRunId(db),
           ai: ai.status(),
+          embeddings: embeddings.status(),
         });
       }
 
@@ -259,7 +327,12 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
       }
 
       if (request.method === 'GET' && url.pathname === '/api/papers') {
-        return json(response, 200, { papers: listPapers(db, parsePaperFilters(url)), paperCategoryGroups: listInboxCategoryGroups(db), stats: getStats(db) });
+        return json(response, 200, {
+          papers: listPapers(db, parsePaperFilters(url)),
+          paperCategoryGroups: listInboxCategoryGroups(db),
+          stats: getStats(db),
+          latestSyncRunId: getLatestCompletedSyncRunId(db),
+        });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/ai/config') {
@@ -274,10 +347,7 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
           setSetting(db, 'ai_processing_mode', payload.mode);
         }
         if (payload.baseUrl != null) {
-          let parsed;
-          try { parsed = new URL(String(payload.baseUrl).trim()); } catch { throw Object.assign(new Error('Invalid AI Base URL.'), { statusCode: 400 }); }
-          if (!['http:', 'https:'].includes(parsed.protocol)) throw Object.assign(new Error('AI Base URL must use http or https.'), { statusCode: 400 });
-          setSetting(db, 'ai_base_url', parsed.toString().replace(/\/$/, ''));
+          setSetting(db, 'ai_base_url', normalizeServiceUrl(payload.baseUrl, 'LLM'));
         }
         if (payload.model != null) {
           const model = String(payload.model).trim();
@@ -286,13 +356,14 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
         }
         if (payload.maxConcurrency != null) {
           const value = Number(payload.maxConcurrency);
-          if (!Number.isInteger(value) || value < 1 || value > 10) throw Object.assign(new Error('AI concurrency must be between 1 and 10.'), { statusCode: 400 });
+          if (!Number.isInteger(value) || value < 1) throw Object.assign(new Error('AI concurrency must be a positive integer.'), { statusCode: 400 });
           setSetting(db, 'ai_max_concurrency', value);
         }
         if (payload.abstractDisplayMode != null) {
           if (!['original', 'translated', 'bilingual'].includes(payload.abstractDisplayMode)) throw Object.assign(new Error('Invalid abstract display mode.'), { statusCode: 400 });
           setSetting(db, 'abstract_display_mode', payload.abstractDisplayMode);
         }
+        updateApiKey(db, 'ai_api_key', payload);
         if (getAiConfiguration(db).mode === 'auto') backfill = enqueueUnprocessedInboxAnalyses(db);
         ai.configurationChanged();
         return json(response, 200, { ...ai.status(), backfill });
@@ -300,15 +371,76 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
 
       if (request.method === 'POST' && url.pathname === '/api/ai/test') {
         const payload = await readJson(request);
-        const config = getAiConfiguration(db);
+        const config = getAiConfiguration(db, { includeApiKey: true });
         if (payload.baseUrl != null) config.baseUrl = String(payload.baseUrl).trim();
         if (payload.model != null) config.model = String(payload.model).trim();
+        if (payload.apiKey != null) config.apiKey = String(payload.apiKey).trim();
         const result = await testAiConnection(config);
         return json(response, 200, result);
       }
 
       if (request.method === 'GET' && url.pathname === '/api/ai/status') {
         return json(response, 200, ai.status());
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/embeddings/config') {
+        return json(response, 200, embeddings.status());
+      }
+
+      if (request.method === 'PATCH' && url.pathname === '/api/embeddings/config') {
+        const payload = await readJson(request);
+        const previous = getEmbeddingConfiguration(db);
+        if (payload.mode != null) {
+          if (!['off', 'auto'].includes(payload.mode)) throw Object.assign(new Error('Invalid embedding processing mode.'), { statusCode: 400 });
+          setSetting(db, 'embedding_processing_mode', payload.mode);
+        }
+        if (payload.baseUrl != null) setSetting(db, 'embedding_base_url', normalizeServiceUrl(payload.baseUrl, 'Embedding'));
+        if (payload.model != null) {
+          const model = String(payload.model).trim();
+          if (!model || model.length > 200) throw Object.assign(new Error('Embedding model is required.'), { statusCode: 400 });
+          setSetting(db, 'embedding_model', model);
+        }
+        if (payload.batchSize != null) {
+          const value = Number(payload.batchSize);
+          if (!Number.isInteger(value) || value < 1 || value > 256) throw Object.assign(new Error('Embedding batch size must be between 1 and 256.'), { statusCode: 400 });
+          setSetting(db, 'embedding_batch_size', value);
+        }
+        if (payload.threshold != null) {
+          const value = Number(payload.threshold);
+          if (!Number.isFinite(value) || value < -1 || value > 1) throw Object.assign(new Error('Classification threshold must be between -1 and 1.'), { statusCode: 400 });
+          setSetting(db, 'classification_threshold', value);
+        }
+        if (payload.margin != null) {
+          const value = Number(payload.margin);
+          if (!Number.isFinite(value) || value < 0 || value > 2) throw Object.assign(new Error('Classification margin must be between 0 and 2.'), { statusCode: 400 });
+          setSetting(db, 'classification_margin', value);
+        }
+        if (payload.archiveColor != null) setSetting(db, 'archive_color', normalizeColor(payload.archiveColor));
+        updateApiKey(db, 'embedding_api_key', payload);
+        const current = getEmbeddingConfiguration(db);
+        const reset = previous.model !== current.model;
+        embeddings.configurationChanged({ reset });
+        return json(response, 200, { ...embeddings.status(), reset });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/embeddings/test') {
+        const payload = await readJson(request);
+        const config = getEmbeddingConfiguration(db, { includeApiKey: true });
+        if (payload.baseUrl != null) config.baseUrl = String(payload.baseUrl).trim();
+        if (payload.model != null) config.model = String(payload.model).trim();
+        if (payload.apiKey != null) config.apiKey = String(payload.apiKey).trim();
+        return json(response, 200, await testEmbeddingConnection(config));
+      }
+
+      if (request.method === 'GET' && url.pathname === '/api/embeddings/status') {
+        return json(response, 200, embeddings.status());
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/embeddings/retry-failed') {
+        if (getEmbeddingConfiguration(db).mode !== 'auto') throw Object.assign(new Error('Enable automatic embedding processing before retrying.'), { statusCode: 409 });
+        const result = enqueueFailedPaperEmbeddings(db);
+        embeddings.configurationChanged();
+        return json(response, 202, { ...result, status: embeddings.status() });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/runtime/shutdown') {
@@ -339,6 +471,13 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
         return json(response, 202, { ...result, status: ai.status() });
       }
 
+      if (request.method === 'POST' && url.pathname === '/api/ai/retry-failed') {
+        if (getAiConfiguration(db).mode === 'off') throw Object.assign(new Error('Enable Manual or Auto AI processing before retrying.'), { statusCode: 409 });
+        const result = enqueueFailedPaperAnalyses(db);
+        ai.configurationChanged();
+        return json(response, 202, { ...result, status: ai.status() });
+      }
+
       const versionsMatch = url.pathname.match(/^\/api\/papers\/(.+)\/versions$/);
       if (request.method === 'GET' && versionsMatch) {
         const paperId = decodeURIComponent(versionsMatch[1]);
@@ -351,7 +490,7 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
       if (request.method === 'POST' && paperAiRetryMatch) {
         if (getAiConfiguration(db).mode === 'off') throw Object.assign(new Error('Enable Manual or Auto AI processing before retrying.'), { statusCode: 409 });
         const result = enqueuePaperAnalyses(db, [decodeURIComponent(paperAiRetryMatch[1])], 'manual', { force: true });
-        ai.kick();
+        ai.configurationChanged();
         return json(response, 202, result);
       }
 
@@ -366,7 +505,8 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
       const paperMatch = url.pathname.match(/^\/api\/papers\/(.+)$/);
       if (request.method === 'PATCH' && paperMatch) {
         const payload = await readJson(request);
-        transaction(db, () => changePaperState(db, decodeURIComponent(paperMatch[1]), payload.action, payload));
+        const change = transaction(db, () => changePaperState(db, decodeURIComponent(paperMatch[1]), payload.action, payload));
+        if (change.classificationChanged) embeddings.classificationChanged();
         return json(response, 200, { ok: true, stats: getStats(db) });
       }
 
@@ -375,9 +515,15 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
         if (!Array.isArray(payload.paperIds) || payload.paperIds.length === 0 || payload.paperIds.length > 500) {
           throw Object.assign(new Error('Select between 1 and 500 papers.'), { statusCode: 400 });
         }
-        transaction(db, () => {
-          for (const paperId of [...new Set(payload.paperIds)]) changePaperState(db, paperId, payload.action, payload);
+        const classificationChanged = transaction(db, () => {
+          let changed = false;
+          for (const paperId of [...new Set(payload.paperIds)]) {
+            const result = changePaperState(db, paperId, payload.action, payload);
+            changed = changed || result.classificationChanged;
+          }
+          return changed;
         });
+        if (classificationChanged) embeddings.classificationChanged();
         return json(response, 200, { ok: true, stats: getStats(db) });
       }
 
@@ -395,7 +541,8 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
           ON CONFLICT(category) DO UPDATE SET enabled = 1, paused_at = NULL, unsubscribed_at = NULL
         `).run(category, now);
         const subscription = db.prepare('SELECT * FROM subscriptions WHERE category = ? COLLATE NOCASE').get(category);
-        const result = await syncSubscriptions(db, [subscription]);
+        const result = await syncSubscriptions(db, [subscription], syncOptions);
+        embeddings.kick();
         return json(response, result.failedCount ? 202 : 201, { subscription, sync: result, subscriptions: listSubscriptions(db), paperCategoryGroups: listInboxCategoryGroups(db), stats: getStats(db) });
       }
 
@@ -422,15 +569,36 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
 
       if (request.method === 'POST' && url.pathname === '/api/sync') {
         const payload = await readJson(request);
+        const afterSyncRunId = payload.afterSyncRunId == null ? null : Number(payload.afterSyncRunId);
+        if (afterSyncRunId != null && (!Number.isInteger(afterSyncRunId) || afterSyncRunId < 0)) {
+          throw Object.assign(new Error('Invalid sync cursor.'), { statusCode: 400 });
+        }
         let subscriptions;
         if (payload.subscriptionId) {
           subscriptions = db.prepare('SELECT * FROM subscriptions WHERE id = ? AND enabled = 1 AND unsubscribed_at IS NULL').all(Number(payload.subscriptionId));
         } else {
           subscriptions = db.prepare('SELECT * FROM subscriptions WHERE enabled = 1 AND unsubscribed_at IS NULL ORDER BY category').all();
         }
-        const result = await syncSubscriptions(db, subscriptions);
+        const result = await syncSubscriptions(db, subscriptions, syncOptions);
+        const changesSince = afterSyncRunId == null
+          ? {
+              runCount: 1,
+              newCount: result.newCount,
+              updatedCount: result.updatedCount,
+              failedCount: result.failedCount,
+              latestSyncRunId: result.runId,
+            }
+          : getSyncChangesSince(db, afterSyncRunId, result.runId);
         ai.kick();
-        return json(response, 200, { ...result, subscriptions: listSubscriptions(db), paperCategoryGroups: listInboxCategoryGroups(db), stats: getStats(db) });
+        embeddings.kick();
+        return json(response, 200, {
+          ...result,
+          changesSince,
+          latestSyncRunId: result.runId,
+          subscriptions: listSubscriptions(db),
+          paperCategoryGroups: listInboxCategoryGroups(db),
+          stats: getStats(db),
+        });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/collections') {
@@ -441,17 +609,34 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
         const payload = await readJson(request);
         const name = String(payload.name ?? '').trim();
         if (!name || name.length > 80) throw Object.assign(new Error('Collection name must be 1–80 characters.'), { statusCode: 400 });
-        const result = db.prepare('INSERT INTO collections (name, created_at) VALUES (?, ?)').run(name, new Date().toISOString());
+        const palette = ['#0ea5e9', '#f59e0b', '#8b5cf6', '#10b981', '#ef4444', '#06b6d4', '#ec4899', '#84cc16'];
+        const color = payload.color == null
+          ? palette[Number(db.prepare('SELECT COUNT(*) AS count FROM collections').get().count) % palette.length]
+          : normalizeColor(payload.color);
+        const result = db.prepare('INSERT INTO collections (name, color, created_at) VALUES (?, ?, ?)').run(name, color, new Date().toISOString());
+        embeddings.classificationChanged();
         return json(response, 201, { collectionId: Number(result.lastInsertRowid), collections: listCollections(db) });
       }
 
       const collectionMatch = url.pathname.match(/^\/api\/collections\/(\d+)$/);
+      if (collectionMatch && request.method === 'PATCH') {
+        const id = Number(collectionMatch[1]);
+        const payload = await readJson(request);
+        const collection = db.prepare('SELECT * FROM collections WHERE id = ?').get(id);
+        if (!collection) throw Object.assign(new Error('Collection not found.'), { statusCode: 404 });
+        const name = payload.name == null ? collection.name : String(payload.name).trim();
+        if (!name || name.length > 80) throw Object.assign(new Error('Collection name must be 1–80 characters.'), { statusCode: 400 });
+        const color = payload.color == null ? collection.color : normalizeColor(payload.color);
+        db.prepare('UPDATE collections SET name = ?, color = ? WHERE id = ?').run(name, color, id);
+        return json(response, 200, { collections: listCollections(db) });
+      }
       if (collectionMatch && request.method === 'DELETE') {
         const id = Number(collectionMatch[1]);
         const collection = db.prepare('SELECT name FROM collections WHERE id = ?').get(id);
         if (!collection) throw Object.assign(new Error('Collection not found.'), { statusCode: 404 });
         if (collection.name === 'Favorites') throw Object.assign(new Error('Favorites cannot be deleted.'), { statusCode: 400 });
         db.prepare('DELETE FROM collections WHERE id = ?').run(id);
+        embeddings.classificationChanged();
         return noContent(response);
       }
 
@@ -489,6 +674,8 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
       if (request.method === 'POST' && url.pathname === '/api/restore') {
         const payload = await readJson(request);
         const safetyBackup = restoreBackup(db, payload);
+        ai.configurationChanged();
+        embeddings.configurationChanged();
         return json(response, 200, { ok: true, safetyBackup, stats: getStats(db) });
       }
 
@@ -502,7 +689,7 @@ export function createApp({ db = createDatabase(), port = PORT, startAiWorker = 
   };
 
   server = http.createServer(handler);
-  return { db, ai, handler, server, shutdown };
+  return { db, ai, embeddings, handler, server, shutdown };
 }
 
 const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
@@ -523,6 +710,7 @@ if (isMainModule) {
     if (due.length) {
       await syncSubscriptions(app.db, due);
       app.ai.kick();
+      app.embeddings.kick();
     }
   }, 60 * 60 * 1_000);
   scheduler.unref();

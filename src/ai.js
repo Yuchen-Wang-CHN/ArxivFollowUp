@@ -1,5 +1,5 @@
 import { AI_API_KEY } from './config.js';
-import { enqueueUnprocessedInboxAnalyses, getAiQueueStatus, getSettings, transaction } from './db.js';
+import { enqueueUnprocessedInboxAnalyses, getAiQueueStatus, getSecret, getSettings, transaction } from './db.js';
 
 const PROMPT_VERSION = 1;
 const MAX_ATTEMPTS = 3;
@@ -11,21 +11,25 @@ function normalizeBaseUrl(value) {
   return url.toString().replace(/\/$/, '');
 }
 
-export function getAiConfiguration(db) {
+export function getAiConfiguration(db, { includeApiKey = false } = {}) {
   const settings = getSettings(db);
-  return {
+  const configuredConcurrency = Number(settings.ai_max_concurrency);
+  const savedApiKey = getSecret(db, 'ai_api_key');
+  const configuration = {
     mode: settings.ai_processing_mode ?? 'off',
     baseUrl: settings.ai_base_url,
     model: settings.ai_model,
-    maxConcurrency: Math.min(Math.max(Number(settings.ai_max_concurrency) || 10, 1), 10),
+    maxConcurrency: Number.isInteger(configuredConcurrency) && configuredConcurrency > 0 ? configuredConcurrency : 10,
     timeoutSeconds: Math.min(Math.max(Number(settings.ai_request_timeout_seconds) || 120, 10), 600),
     abstractDisplayMode: settings.abstract_display_mode ?? 'original',
-    apiKeyConfigured: Boolean(AI_API_KEY),
+    apiKeyConfigured: Boolean(savedApiKey || AI_API_KEY),
   };
+  if (includeApiKey) configuration.apiKey = savedApiKey || AI_API_KEY;
+  return configuration;
 }
 
-function authorizationHeaders() {
-  return AI_API_KEY ? { Authorization: `Bearer ${AI_API_KEY}` } : {};
+function authorizationHeaders(apiKey) {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 }
 
 function requestBody(model, title, abstract) {
@@ -68,7 +72,7 @@ function requestBody(model, title, abstract) {
 async function callVllm(config, title, abstract, fetchImpl = fetch) {
   const response = await fetchImpl(`${normalizeBaseUrl(config.baseUrl)}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authorizationHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authorizationHeaders(config.apiKey) },
     body: JSON.stringify(requestBody(config.model, title, abstract)),
     signal: AbortSignal.timeout(config.timeoutSeconds * 1_000),
   });
@@ -202,7 +206,7 @@ export function createAiCoordinator(db, options = {}) {
 
   const pump = () => {
     if (stopped) return;
-    const config = getAiConfiguration(db);
+    const config = getAiConfiguration(db, { includeApiKey: true });
     while (!blockedError && config.mode !== 'off' && active.size < config.maxConcurrency) {
       const job = claimNextJob(db, config.mode);
       if (!job) break;
