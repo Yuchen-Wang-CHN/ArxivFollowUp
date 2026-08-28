@@ -26,10 +26,10 @@ ArxivFollowUp 是一款本地运行的 arXiv 论文追踪工具。订阅 `cs.AI`
 
 ### 用 Embedding 预分类 Inbox
 
-- LLM 分析与 Embedding 使用两套独立的 OpenAI-compatible API、模型和密钥
-- 为当前保留的论文版本批量生成嵌入，只使用 Collection 作为兴趣分类样本
-- 分数超过阈值且领先幅度足够时，为 Inbox 论文显示默认预测类别
-- 每个 Collection 与 Archive 记录使用可配置颜色；预测只做视觉标记，不会自动移动论文
+- LLM 分析与 Embedding 可分别配置 API、模型和密钥
+- 根据 Collection 中的论文学习你的兴趣分类
+- 在 Inbox 中显示预测类别，帮助你优先浏览可能感兴趣的论文
+- 可为 Collection 和 Archive 设置颜色；预测标签不会改变论文所在位置
 
 AI 完全可选。关闭后，订阅、同步和阅读管理仍可正常使用。
 
@@ -37,7 +37,7 @@ AI 完全可选。关闭后，订阅、同步和阅读管理仍可正常使用�
 
 - 使用 Read / Unread 标记阅读状态
 - 通过 Archive 表示不感兴趣，同时保留论文与 AI 内容供以后查看
-- 可在 Archive 中明确删除单篇论文的本地内容，删除后条目立即消失
+- 可从 Archive 中删除不再需要的本地内容
 - 使用多个 Collection 保存值得继续关注的论文
 - 支持本地搜索、Category 与状态筛选、批量处理，以及每页 100 篇的分页
 
@@ -90,7 +90,7 @@ npm start
 
 在 **Settings → LLM analysis** 中填写服务地址、模型和独立 API key，然后选择处理模式：
 
-实测 Qwen3.8 27B 模型可用。
+例如，可以使用 Qwen3.8 27B 等支持 OpenAI-compatible API 的模型。
 
 - **关闭**：不创建新任务，但继续显示已有结果
 - **自动**：自动分析 Inbox 中的新论文和新版本
@@ -113,7 +113,7 @@ npm start
 
 Settings 中保存的配置优先用于后续启动。
 
-LLM API key 可以直接在 Settings 中保存，也可以继续通过 `AFU_AI_API_KEY` 提供。密钥仅保存在本地数据库的 secrets 表中，不会通过 bootstrap API 回显或写入 JSON 备份。
+LLM API key 可以保存在 Settings 中，也可以通过 `AFU_AI_API_KEY` 提供。保存在 Settings 中的密钥不会写入 JSON 备份。
 
 ## Embedding 与默认分类
 
@@ -124,7 +124,9 @@ Base URL  http://127.0.0.1:8001/v1
 Model     Qwen/Qwen3-Embedding-0.6B
 ```
 
-启用自动模式后，AFU 会批量嵌入当前仍保留的论文。Collection 中的论文是对应兴趣类别的正样本，Archive 完全不参与相似度或分类画像。分类分数超过阈值，并且第一名相对第二名达到 Winning margin 时，Inbox 论文卡片会显示带颜色的预测标签。加入或移出 Collection 后，相关分类画像会自动重算；单纯 Archive 不会触发其他论文的重算。
+启用后，AFU 会为本地论文生成 Embedding，并根据各个 Collection 中的论文建立兴趣分类。预测结果足够明确时，Inbox 卡片会显示对应的彩色标签。你可以在 Settings 中调整最低分数和领先幅度（Winning margin）；Collection 内容变化后，分类会自动更新。
+
+Archive 中的论文不会参与分类。预测标签仅用于辅助浏览，不会自动移动或归档论文。
 
 Embedding 服务也可以通过环境变量提供默认值：
 
@@ -136,11 +138,11 @@ Embedding 服务也可以通过环境变量提供默认值：
 
 ## 同步与数据
 
-AFU 使用 arXiv RSS 发现论文，因此它从开始订阅时向后持续追踪，不会补抓 RSS 覆盖范围之外的完整历史。版本历史同样只表示 AFU 在本地实际观察到的版本。
+AFU 通过 arXiv RSS 持续发现新论文和版本更新，从你添加订阅时开始追踪。自动同步间隔可设置为 1–7 天，也可以随时点击 **Sync now**。
 
-Archive 本身只将论文移出 Inbox，并保留论文元数据、版本历史、AI 分析和 Embedding。用户在 Archive 中明确选择“删除本地内容”后，AFU 才会级联清理这些数据，条目也会立即从 Archive 消失。数据库内部只留下不可见的 arXiv ID、删除版本号与时间，用于让后续 RSS 忽略相同或更低版本；只有更高版本才会重新以 **Updated** 状态进入 Inbox。AFU 不下载 PDF，因此这里删除的是 SQLite 中的本地论文内容，而不是 PDF 文件。
+Archive 会将论文移出 Inbox，但保留论文信息、版本历史和 AI 结果。若确定不再需要，可以在 Archive 中选择“删除本地内容”。以后出现更高版本时，这篇论文仍会作为 **Updated** 重新进入 Inbox。
 
-自动同步间隔可设置为 1–7 天，并只在 AFU 运行期间执行。你也可以随时点击 **Sync now** 手动同步。
+AFU 不下载 PDF；论文信息、阅读状态、AI 结果和 Embedding 都保存在本地 SQLite 中。
 
 数据库和备份默认保存在：
 
@@ -157,9 +159,7 @@ data/backups/
 | `AFU_DATABASE_PATH` | `./data/afu.db` | 自定义数据库文件路径 |
 | `PORT` | `43110` | 本地 HTTP 端口 |
 
-旧版 `data/localrss.db` 会被自动识别。完整数据可以在 Settings 中导出为 JSON；恢复备份前，AFU 会先为当前数据库创建安全副本。
-
-删除本地内容后，SQLite 数据库文件通常不会立即缩小，但释放出来的页会被后续数据复用。
+旧版 `data/localrss.db` 会被自动识别。你可以在 Settings 中导出或恢复 JSON 备份；恢复前，AFU 会自动备份当前数据库。
 
 ## 开发
 
