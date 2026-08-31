@@ -152,6 +152,8 @@ test('metadata enrichment stores real published and latest-version dates', async
 test('backup restores all user data and creates a safety copy', () => {
   const { db, subscription } = setup();
   ingestFeed(db, subscription, { papers: [item(1)], errors: [] });
+  db.prepare('UPDATE user_paper_states SET note = ?, note_updated_at = ? WHERE paper_id = ?')
+    .run('## My note\n\nRemember this result.', '2026-08-20T01:00:00.000Z', '2508.12345');
   const backup = exportBackup(db);
   assert.equal(backup.format, 'arxiv-follow-up-backup');
   db.prepare("DELETE FROM paper_subscriptions").run();
@@ -162,6 +164,10 @@ test('backup restores all user data and creates a safety copy', () => {
   restoreBackup(db, backup, { backupDirectory });
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM papers').get().count, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM user_paper_states').get().count, 1);
+  assert.deepEqual({ ...db.prepare('SELECT note, note_updated_at FROM user_paper_states').get() }, {
+    note: '## My note\n\nRemember this result.',
+    note_updated_at: '2026-08-20T01:00:00.000Z',
+  });
   db.close();
   fs.rmSync(backupDirectory, { recursive: true, force: true });
 });

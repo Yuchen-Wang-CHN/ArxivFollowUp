@@ -33,7 +33,7 @@ import {
   testEmbeddingConnection,
 } from './embeddings.js';
 import { fetchCategoryTaxonomy, getFallbackCategories } from './arxiv.js';
-import { HOST, KATEX_DIRECTORY, PORT, PUBLIC_DIRECTORY } from './config.js';
+import { DOMPURIFY_FILE, HOST, KATEX_DIRECTORY, MARKED_FILE, PORT, PUBLIC_DIRECTORY } from './config.js';
 import { dueSubscriptions, enrichPaperDates, syncSubscriptions } from './sync.js';
 
 const MIME_TYPES = {
@@ -232,6 +232,25 @@ function changePaperState(db, paperId, action, options = {}) {
 }
 
 function serveStatic(response, pathname) {
+  const exactVendorFiles = {
+    '/vendor/marked/marked.umd.js': MARKED_FILE,
+    '/vendor/dompurify/purify.min.js': DOMPURIFY_FILE,
+  };
+  const exactVendorFile = exactVendorFiles[pathname];
+  if (exactVendorFile) {
+    if (!fs.existsSync(exactVendorFile) || !fs.statSync(exactVendorFile).isFile()) {
+      json(response, 404, { error: 'Not found.' });
+      return;
+    }
+    const content = fs.readFileSync(exactVendorFile);
+    response.writeHead(200, {
+      'Content-Type': 'text/javascript; charset=utf-8',
+      'Content-Length': content.length,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    });
+    response.end(content);
+    return;
+  }
   const isKatexAsset = pathname.startsWith('/vendor/katex/');
   const rootDirectory = isKatexAsset ? KATEX_DIRECTORY : PUBLIC_DIRECTORY;
   const relative = isKatexAsset
@@ -515,6 +534,20 @@ export function createApp({
         const paper = db.prepare('SELECT id, latest_version FROM papers WHERE id = ?').get(paperId);
         if (!paper) throw Object.assign(new Error('Paper not found.'), { statusCode: 404 });
         return json(response, 200, { analysis: getPaperAiAnalysis(db, paperId) });
+      }
+
+      const paperNoteMatch = url.pathname.match(/^\/api\/papers\/(.+)\/note$/);
+      if (request.method === 'PATCH' && paperNoteMatch) {
+        const payload = await readJson(request, 256 * 1024);
+        if (typeof payload.note !== 'string') throw Object.assign(new Error('Note must be a string.'), { statusCode: 400 });
+        if (payload.note.length > 100_000) throw Object.assign(new Error('Note must not exceed 100,000 characters.'), { statusCode: 400 });
+        const paperId = decodeURIComponent(paperNoteMatch[1]);
+        const note = payload.note.trim() ? payload.note : null;
+        const noteUpdatedAt = note ? new Date().toISOString() : null;
+        const result = db.prepare('UPDATE user_paper_states SET note = ?, note_updated_at = ? WHERE paper_id = ?')
+          .run(note, noteUpdatedAt, paperId);
+        if (result.changes === 0) throw Object.assign(new Error('Paper not found.'), { statusCode: 404 });
+        return json(response, 200, { note, noteUpdatedAt });
       }
 
       const paperMatch = url.pathname.match(/^\/api\/papers\/(.+)$/);

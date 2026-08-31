@@ -22,6 +22,13 @@ test('serves bootstrap and validates local mutation header', async (context) => 
   assert.match(katexResponse.headers.get('content-type'), /^text\/css/);
   assert.match(await katexResponse.text(), /\.katex/);
 
+  const markedResponse = await fetch(`http://127.0.0.1:${port}/vendor/marked/marked.umd.js`);
+  assert.equal(markedResponse.status, 200);
+  assert.match(markedResponse.headers.get('content-type'), /^text\/javascript/);
+
+  const domPurifyResponse = await fetch(`http://127.0.0.1:${port}/vendor/dompurify/purify.min.js`);
+  assert.equal(domPurifyResponse.status, 200);
+
   const denied = await fetch(`http://127.0.0.1:${port}/api/settings`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ refreshIntervalDays: 2 }),
   });
@@ -77,6 +84,49 @@ test('paper API accepts repeated category and category-group filters', async (co
   const mixedResponse = await fetch(`http://127.0.0.1:${port}/api/papers?categoryGroup=stat&category=math.OC`);
   assert.equal(mixedResponse.status, 200);
   assert.deepEqual((await mixedResponse.json()).papers.map((item) => item.id).sort(), ['2608.00002', '2608.00003']);
+});
+
+test('paper notes save Markdown, appear in search, survive version updates, and can be cleared', async (context) => {
+  const db = createDatabase(':memory:');
+  const now = '2026-08-20T00:00:00.000Z';
+  const inserted = db.prepare("INSERT INTO subscriptions (category, created_at) VALUES ('cs.AI', ?)").run(now);
+  const subscription = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(Number(inserted.lastInsertRowid));
+  const paper = {
+    id: '2608.00009', version: 1, title: 'Paper with notes', authors: 'Author', abstract: 'Abstract',
+    categories: ['cs.AI'], announcedAt: now, arxivUrl: 'https://arxiv.org/abs/2608.00009',
+    pdfUrl: 'https://arxiv.org/pdf/2608.00009', announceType: 'new',
+  };
+  ingestFeed(db, subscription, { errors: [], papers: [paper] }, now);
+
+  const app = createApp({ db, port: 0 });
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  context.after(() => { app.server.close(); db.close(); });
+  const { port } = app.server.address();
+  const note = '# Key idea\n\n- reproduce experiment\n- compare with **baseline**';
+  const saved = await fetch(`http://127.0.0.1:${port}/api/papers/${paper.id}/note`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' },
+    body: JSON.stringify({ note }),
+  });
+  assert.equal(saved.status, 200);
+  assert.equal((await saved.json()).note, note);
+
+  const search = await (await fetch(`http://127.0.0.1:${port}/api/papers?q=reproduce`)).json();
+  assert.equal(search.papers[0].note, note);
+  assert.ok(search.papers[0].note_updated_at);
+
+  ingestFeed(db, subscription, { errors: [], papers: [{
+    ...paper, version: 2, abstract: 'Updated abstract', announceType: 'replace',
+  }] }, '2026-08-21T00:00:00.000Z');
+  assert.equal(db.prepare('SELECT note FROM user_paper_states WHERE paper_id = ?').get(paper.id).note, note);
+
+  const cleared = await fetch(`http://127.0.0.1:${port}/api/papers/${paper.id}/note`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' },
+    body: JSON.stringify({ note: '   ' }),
+  });
+  assert.equal(cleared.status, 200);
+  assert.deepEqual(await cleared.json(), { note: null, noteUpdatedAt: null });
 });
 
 test('sync API reports changes from a background run unseen by the page', async (context) => {

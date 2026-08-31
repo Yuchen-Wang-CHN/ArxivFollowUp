@@ -58,7 +58,7 @@
         <div class="workspace-tools">
           <label class="search-box">
             <span>⌕</span>
-            <input id="search-input" type="search" placeholder="Search title, author, abstract or arXiv ID" autocomplete="off">
+            <input id="search-input" type="search" placeholder="Search title, author, abstract, notes or arXiv ID" autocomplete="off">
           </label>
           <div class="filter-row">
             <details class="category-multiselect" id="category-filter">
@@ -243,6 +243,8 @@
   <div class="toast-region" id="toast-region" aria-live="polite"></div>
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="/vendor/marked/marked.umd.js"></script>
+  <script src="/vendor/dompurify/purify.min.js"></script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

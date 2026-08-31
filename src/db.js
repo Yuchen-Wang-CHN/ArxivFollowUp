@@ -245,6 +245,10 @@ function migrate(db) {
     `);
   }
 
+  const userPaperStateColumns = new Set(db.prepare('PRAGMA table_info(user_paper_states)').all().map((column) => column.name));
+  if (!userPaperStateColumns.has('note')) db.exec('ALTER TABLE user_paper_states ADD COLUMN note TEXT');
+  if (!userPaperStateColumns.has('note_updated_at')) db.exec('ALTER TABLE user_paper_states ADD COLUMN note_updated_at TEXT');
+
   const now = new Date().toISOString();
   db.prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('refresh_interval_days', '1');
@@ -419,8 +423,8 @@ export function listPapers(db, filters = {}) {
 
   if (filters.q) {
     const query = `%${filters.q.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
-    conditions.push(`(p.title LIKE ? ESCAPE '\\' OR p.authors LIKE ? ESCAPE '\\' OR p.abstract LIKE ? ESCAPE '\\' OR p.id LIKE ? ESCAPE '\\' OR p.categories_json LIKE ? ESCAPE '\\')`);
-    values.push(query, query, query, query, query);
+    conditions.push(`(p.title LIKE ? ESCAPE '\\' OR p.authors LIKE ? ESCAPE '\\' OR p.abstract LIKE ? ESCAPE '\\' OR p.id LIKE ? ESCAPE '\\' OR p.categories_json LIKE ? ESCAPE '\\' OR ups.note LIKE ? ESCAPE '\\')`);
+    values.push(query, query, query, query, query, query);
   }
   const selectedCategories = filterList(filters.categories ?? filters.category);
   const selectedCategoryGroups = filterList(filters.categoryGroups ?? filters.categoryGroup);
@@ -465,7 +469,7 @@ export function listPapers(db, filters = {}) {
 
   const rows = db.prepare(`
     SELECT p.*, ups.is_read, ups.unread_reason, ups.in_inbox, ups.inbox_activity_at,
-      ups.archived_version, ups.archived_at,
+      ups.archived_version, ups.archived_at, ups.note, ups.note_updated_at,
       paa.status AS ai_status, paa.explanation_zh, paa.translation_zh IS NOT NULL AS has_translation_zh,
       pcl.target_type AS predicted_target_type, pcl.target_collection_id AS predicted_collection_id,
       pcl.score AS classification_score, pcl.second_score AS classification_second_score,
@@ -672,7 +676,7 @@ export function exportBackup(db) {
 
 export function restoreBackup(db, payload, options = {}) {
   const compatibleFormats = new Set(['arxiv-follow-up-backup', 'localrss-backup']);
-  if (!payload || !compatibleFormats.has(payload.format) || ![1, 2, 3, 4, SCHEMA_VERSION].includes(payload.schemaVersion) || !payload.tables) {
+  if (!payload || !compatibleFormats.has(payload.format) || ![1, 2, 3, 4, 5, SCHEMA_VERSION].includes(payload.schemaVersion) || !payload.tables) {
     throw new Error('This is not a compatible ArxivFollowUp backup.');
   }
 

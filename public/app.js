@@ -13,6 +13,7 @@ const state = {
   embeddingPollTimer: null,
   paperLoadRequest: 0,
   latestSyncRunId: 0,
+  noteSaves: new Map(),
 };
 
 const PAPER_PAGE_SIZE = 100;
@@ -87,6 +88,34 @@ function renderLatex(root) {
     trust: false,
     errorCallback: () => {},
   });
+}
+
+function markdownHtml(value) {
+  const source = String(value ?? '');
+  if (!source.trim()) return '<p class="note-empty">还没有笔记，在左侧输入 Markdown 即可开始。</p>';
+  if (typeof globalThis.marked?.parse !== 'function' || typeof globalThis.DOMPurify?.sanitize !== 'function') {
+    return `<p>${escapeHtml(source).replaceAll('\n', '<br>')}</p>`;
+  }
+  try {
+    const parsed = globalThis.marked.parse(source, { gfm: true, breaks: true });
+    return globalThis.DOMPurify.sanitize(parsed, { USE_PROFILES: { html: true } });
+  } catch {
+    return `<p>${escapeHtml(source).replaceAll('\n', '<br>')}</p>`;
+  }
+}
+
+function prepareMarkdownLinks(root) {
+  root?.querySelectorAll('.markdown-body a').forEach((link) => {
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+  });
+}
+
+function renderMarkdownInto(element, value) {
+  if (!element) return;
+  element.innerHTML = markdownHtml(value);
+  prepareMarkdownLinks(element);
+  renderLatex(element);
 }
 
 function formatDate(value, includeTime = false) {
@@ -356,6 +385,12 @@ function paperCard(paper) {
   const classificationBadge = classification
     ? `<span class="classification-badge" title="${classification.confirmed ? '用户确认分类' : 'Embedding 默认预测分类'}">${classification.confirmed ? '' : '≈ '}${escapeHtml(classification.name)}${classification.score == null ? '' : ` · ${classification.score.toFixed(2)}`}</span>`
     : '';
+  const hasNote = Boolean(paper.note?.trim());
+  const noteSave = state.noteSaves.get(paper.id);
+  const noteStatus = noteSave?.status === 'pending' ? '等待保存…'
+    : noteSave?.status === 'saving' ? '正在保存…'
+      : noteSave?.status === 'error' ? '保存失败，将在下次输入时重试'
+        : paper.note_updated_at ? `已保存 · ${formatDate(paper.note_updated_at, true)}` : '输入后自动保存';
   return `
     <article class="paper-card${archiveClass} ${isUnread ? 'unread' : ''} ${isUpdated ? 'updated' : ''} ${densityClass}${classificationClass}" data-paper-id="${escapeHtml(paper.id)}"${classificationStyle}>
       <label class="paper-check ${state.view === 'archive' ? 'hidden' : ''}"><input class="paper-select" type="checkbox" ${state.selected.has(paper.id) ? 'checked' : ''} aria-label="Select ${escapeHtml(paper.title)}"></label>
@@ -364,6 +399,7 @@ function paperCard(paper) {
           <h3 class="paper-title">${escapeHtml(paper.title)}</h3>
           ${isUpdated ? '<span class="badge updated">Updated</span>' : ''}
           ${classificationBadge}
+          <span class="badge note-badge ${hasNote ? '' : 'hidden'}" title="这篇论文有笔记">Note</span>
         </div>
         <p class="authors">${escapeHtml(paper.authors || 'Unknown authors')}</p>
         ${aiExplanation(paper)}
@@ -400,6 +436,22 @@ function paperCard(paper) {
         ${state.view === 'archive' ? '<button class="text-button danger" data-action="purgeArchive">删除本地内容</button>' : ''}
         <button class="text-button" data-action="versions">Version history</button>
         ${paper.ai_status === 'failed' ? '<button class="text-button" data-action="ai-retry">Retry AI</button>' : ''}
+        <section class="paper-note" aria-label="论文笔记">
+          <div class="paper-note-heading">
+            <strong>笔记</strong>
+            <span class="paper-note-status ${noteSave?.status === 'error' ? 'error' : ''}" aria-live="polite">${escapeHtml(noteStatus)}</span>
+          </div>
+          <div class="paper-note-grid">
+            <label class="paper-note-editor">
+              <span>Markdown</span>
+              <textarea class="paper-note-input" maxlength="100000" spellcheck="true" placeholder="记录想法、疑问、实验结果或待办事项…">${escapeHtml(paper.note ?? '')}</textarea>
+            </label>
+            <div class="paper-note-preview-pane">
+              <span>预览</span>
+              <div class="paper-note-preview markdown-body">${markdownHtml(paper.note)}</div>
+            </div>
+          </div>
+        </section>
         <div class="version-history"></div>
       </div>
     </article>`;
@@ -442,6 +494,7 @@ function renderPapers() {
   } else {
     elements.paperList.innerHTML = state.papers.map(paperCard).join('');
   }
+  prepareMarkdownLinks(elements.paperList);
   renderLatex(elements.paperList);
   updateSelectionUi();
   ensureAiPolling();
@@ -805,6 +858,56 @@ function debounce(callback, wait) {
   };
 }
 
+function setNoteStatus(paperId, text, error = false) {
+  const card = [...elements.paperList.querySelectorAll('.paper-card')]
+    .find((item) => item.dataset.paperId === paperId);
+  const status = card?.querySelector('.paper-note-status');
+  if (!status) return;
+  status.textContent = text;
+  status.classList.toggle('error', error);
+}
+
+async function savePaperNote(paperId, note, revision) {
+  const save = state.noteSaves.get(paperId);
+  if (!save || save.revision !== revision) return;
+  save.timer = null;
+  save.status = 'saving';
+  setNoteStatus(paperId, '正在保存…');
+  try {
+    const payload = await api(`/api/papers/${encodeURIComponent(paperId)}/note`, {
+      method: 'PATCH',
+      body: { note },
+    });
+    const current = state.noteSaves.get(paperId);
+    if (!current || current.revision !== revision) return;
+    current.status = 'saved';
+    const paper = state.papers.find((item) => item.id === paperId);
+    if (paper) {
+      paper.note = payload.note ?? '';
+      paper.note_updated_at = payload.noteUpdatedAt;
+    }
+    const savedLabel = payload.noteUpdatedAt ? `已保存 · ${formatDate(payload.noteUpdatedAt, true)}` : '笔记已清空';
+    setNoteStatus(paperId, savedLabel);
+  } catch (error) {
+    const current = state.noteSaves.get(paperId);
+    if (!current || current.revision !== revision) return;
+    current.status = 'error';
+    setNoteStatus(paperId, '保存失败，将在下次输入时重试', true);
+    toast(error.message, 'error');
+  }
+}
+
+function scheduleNoteSave(paperId, note) {
+  const current = state.noteSaves.get(paperId) ?? { revision: 0, timer: null, status: 'saved' };
+  if (current.timer) clearTimeout(current.timer);
+  current.revision += 1;
+  current.status = 'pending';
+  const revision = current.revision;
+  current.timer = setTimeout(() => savePaperNote(paperId, note, revision), 700);
+  state.noteSaves.set(paperId, current);
+  setNoteStatus(paperId, '等待保存…');
+}
+
 document.querySelectorAll('.nav-item[data-view]').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.view)));
 elements.syncButton.addEventListener('click', () => runSync());
 document.querySelector('#due-sync-button').addEventListener('click', () => runSync());
@@ -873,6 +976,19 @@ elements.paperList.addEventListener('change', (event) => {
   const id = event.target.closest('.paper-card').dataset.paperId;
   if (event.target.checked) state.selected.add(id); else state.selected.delete(id);
   updateSelectionUi();
+});
+
+elements.paperList.addEventListener('input', (event) => {
+  const textarea = event.target.closest('.paper-note-input');
+  if (!textarea) return;
+  const card = textarea.closest('.paper-card');
+  const paperId = card.dataset.paperId;
+  const note = textarea.value;
+  const paper = state.papers.find((item) => item.id === paperId);
+  if (paper) paper.note = note;
+  card.querySelector('.note-badge')?.classList.toggle('hidden', !note.trim());
+  renderMarkdownInto(card.querySelector('.paper-note-preview'), note);
+  scheduleNoteSave(paperId, note);
 });
 
 elements.paperList.addEventListener('keydown', (event) => {

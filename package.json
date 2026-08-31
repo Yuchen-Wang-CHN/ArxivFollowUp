@@ -21,7 +21,9 @@
     "check": "node --check public/app.js && node --check src/server.js && node --check src/embeddings.js && npm test"
   },
   "dependencies": {
+    "dompurify": "3.4.14",
     "fast-xml-parser": "^5.2.5",
-    "katex": "^0.18.4"
+    "katex": "^0.18.4",
+    "marked": "18.0.11"
   }
 }
