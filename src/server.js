@@ -6,7 +6,7 @@ import {
   createDatabase,
   enqueueFailedPaperAnalyses,
   enqueuePaperAnalyses,
-  enqueueUnprocessedInboxAnalyses,
+  enqueueUnprocessedFocusAnalyses,
   exportBackup,
   getAiQueueStatus,
   getLatestCompletedSyncRunId,
@@ -195,7 +195,8 @@ function changePaperState(db, paperId, action, options = {}) {
     const collectionCount = db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count;
     if (collectionCount) throw Object.assign(new Error('Remove the paper from all collections before moving it to Inbox.'), { statusCode: 409 });
     db.prepare(`
-      UPDATE user_paper_states SET in_inbox = 1, inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
+      UPDATE user_paper_states SET in_inbox = 1, is_read = 0, unread_reason = 'manual', read_at = NULL,
+        inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
       WHERE paper_id = ?
     `).run(now, paperId);
     return { classificationChanged: true };
@@ -218,7 +219,8 @@ function changePaperState(db, paperId, action, options = {}) {
     const remainingCount = db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count;
     if (remainingCount === 0) {
       db.prepare(`
-        UPDATE user_paper_states SET in_inbox = 1, inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
+        UPDATE user_paper_states SET in_inbox = 1, is_read = 0, unread_reason = 'manual', read_at = NULL,
+          inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
         WHERE paper_id = ?
       `).run(now, paperId);
     }
@@ -267,7 +269,16 @@ export function createApp({
     ? createAiCoordinator(db)
     : { kick() {}, configurationChanged() {}, stop() {}, status: () => ({ ...getAiQueueStatus(db), active: 0, blockedError: null, ...getAiConfiguration(db) }) };
   const embeddings = startEmbeddingWorker
-    ? createEmbeddingCoordinator(db, embeddingOptions)
+    ? createEmbeddingCoordinator(db, {
+        ...embeddingOptions,
+        onClassificationChanged(result) {
+          if (getSettings(db).ai_processing_mode === 'auto') {
+            enqueueUnprocessedFocusAnalyses(db);
+            ai.kick();
+          }
+          embeddingOptions.onClassificationChanged?.(result);
+        },
+      })
     : {
         kick() {}, configurationChanged() {}, classificationChanged() {}, stop() {},
         status: () => ({ ...getEmbeddingQueueStatus(db), active: 0, blockedError: null, ...getEmbeddingConfiguration(db) }),
@@ -303,7 +314,7 @@ export function createApp({
           subscriptions: listSubscriptions(db),
           collections: listCollections(db),
           categories: categories.length ? categories : getFallbackCategories(),
-          paperCategoryGroups: listInboxCategoryGroups(db),
+          paperCategoryGroups: listInboxCategoryGroups(db, { view: 'focus' }),
           categoriesNeedRefresh: categories.length === 0,
           dueSubscriptionCount: due.length,
           latestSyncRunId: getLatestCompletedSyncRunId(db),
@@ -318,7 +329,8 @@ export function createApp({
       }
 
       if (request.method === 'GET' && url.pathname === '/api/paper-categories') {
-        return json(response, 200, { groups: listInboxCategoryGroups(db) });
+        const view = url.searchParams.get('view') === 'focus' ? 'focus' : 'inbox';
+        return json(response, 200, { groups: listInboxCategoryGroups(db, { view }) });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/categories/refresh') {
@@ -327,9 +339,10 @@ export function createApp({
       }
 
       if (request.method === 'GET' && url.pathname === '/api/papers') {
+        const filters = parsePaperFilters(url);
         return json(response, 200, {
-          papers: listPapers(db, parsePaperFilters(url)),
-          paperCategoryGroups: listInboxCategoryGroups(db),
+          papers: listPapers(db, filters),
+          paperCategoryGroups: listInboxCategoryGroups(db, { view: filters.view === 'focus' ? 'focus' : 'inbox' }),
           stats: getStats(db),
           latestSyncRunId: getLatestCompletedSyncRunId(db),
         });
@@ -364,7 +377,7 @@ export function createApp({
           setSetting(db, 'abstract_display_mode', payload.abstractDisplayMode);
         }
         updateApiKey(db, 'ai_api_key', payload);
-        if (getAiConfiguration(db).mode === 'auto') backfill = enqueueUnprocessedInboxAnalyses(db);
+        if (getAiConfiguration(db).mode === 'auto') backfill = enqueueUnprocessedFocusAnalyses(db);
         ai.configurationChanged();
         return json(response, 200, { ...ai.status(), backfill });
       }
@@ -409,6 +422,8 @@ export function createApp({
           const value = Number(payload.threshold);
           if (!Number.isFinite(value) || value < -1 || value > 1) throw Object.assign(new Error('Classification threshold must be between -1 and 1.'), { statusCode: 400 });
           setSetting(db, 'classification_threshold', value);
+          const focusThreshold = Number(getSettings(db).focus_threshold ?? 0.6);
+          if (value > focusThreshold) setSetting(db, 'focus_threshold', value);
         }
         if (payload.margin != null) {
           const value = Number(payload.margin);
@@ -420,7 +435,7 @@ export function createApp({
         const current = getEmbeddingConfiguration(db);
         const reset = previous.model !== current.model;
         embeddings.configurationChanged({ reset });
-        return json(response, 200, { ...embeddings.status(), reset });
+        return json(response, 200, { ...embeddings.status(), reset, settings: getSettings(db), stats: getStats(db) });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/embeddings/test') {
@@ -655,7 +670,20 @@ export function createApp({
           if (typeof payload.openBrowserOnStart !== 'boolean') throw Object.assign(new Error('Open-browser setting must be boolean.'), { statusCode: 400 });
           setSetting(db, 'open_browser_on_start', payload.openBrowserOnStart ? '1' : '0');
         }
-        return json(response, 200, { settings: getSettings(db) });
+        if (payload.focusThreshold != null) {
+          const value = Number(payload.focusThreshold);
+          if (!Number.isFinite(value) || value < -1 || value > 1) throw Object.assign(new Error('Focus threshold must be between -1 and 1.'), { statusCode: 400 });
+          const classificationThreshold = Number(getSettings(db).classification_threshold ?? 0.55);
+          if (value < classificationThreshold) {
+            throw Object.assign(new Error(`Focus threshold cannot be lower than the classification threshold (${classificationThreshold}).`), { statusCode: 400 });
+          }
+          setSetting(db, 'focus_threshold', value);
+          if (getSettings(db).ai_processing_mode === 'auto') {
+            enqueueUnprocessedFocusAnalyses(db);
+            ai.kick();
+          }
+        }
+        return json(response, 200, { settings: getSettings(db), stats: getStats(db) });
       }
 
       if (request.method === 'GET' && url.pathname === '/api/backup') {

@@ -261,8 +261,9 @@ function migrate(db) {
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('embedding_model', EMBEDDING_DEFAULT_MODEL);
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('embedding_batch_size', '32');
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('embedding_request_timeout_seconds', '120');
-  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('classification_threshold', '0.65');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('classification_threshold', '0.55');
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('classification_margin', '0.03');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('focus_threshold', '0.60');
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('archive_color', '#64748b');
   db.prepare("INSERT OR IGNORE INTO collections (name, color, created_at) VALUES (?, '#f59e0b', ?)").run('Favorites', now);
   db.exec("DELETE FROM paper_classifications WHERE target_type = 'archive'");
@@ -339,15 +340,29 @@ function categoryGroupExpression(valueExpression, cachedGroupExpression) {
   END)`;
 }
 
-export function listInboxCategoryGroups(db) {
+function focusThreshold(db) {
+  const value = Number(db.prepare("SELECT value FROM settings WHERE key = 'focus_threshold'").get()?.value);
+  return Number.isFinite(value) && value >= -1 && value <= 1 ? value : 0.6;
+}
+
+export function listInboxCategoryGroups(db, { view = 'inbox' } = {}) {
   const groupExpression = categoryGroupExpression('inbox_category.code', 'cc.group_code');
+  const focusJoin = view === 'focus'
+    ? 'LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version'
+    : '';
+  const focusFilter = view === 'focus'
+    ? "AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?)"
+    : '';
+  const parameters = view === 'focus' ? [focusThreshold(db)] : [];
   const rows = db.prepare(`
     WITH inbox_categories AS (
       SELECT DISTINCT paper_category.value AS code
       FROM papers p
       JOIN user_paper_states ups ON ups.paper_id = p.id AND ups.in_inbox = 1
+      ${focusJoin}
       JOIN json_each(p.categories_json) paper_category
       WHERE NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)
+        ${focusFilter}
     )
     SELECT inbox_category.code, COALESCE(cc.name, inbox_category.code) AS name,
       ${groupExpression} AS group_code,
@@ -364,7 +379,7 @@ export function listInboxCategoryGroups(db) {
     FROM inbox_categories inbox_category
     LEFT JOIN category_cache cc ON cc.code = inbox_category.code
     ORDER BY group_name COLLATE NOCASE, inbox_category.code COLLATE NOCASE
-  `).all();
+  `).all(...parameters);
   const groups = new Map();
   for (const row of rows) {
     if (!groups.has(row.group_code)) groups.set(row.group_code, { code: row.group_code, name: row.group_name, categories: [] });
@@ -396,6 +411,10 @@ export function listPapers(db, filters = {}) {
     conditions.push('ups.in_inbox = 0 AND ups.archived_at IS NOT NULL');
   } else {
     conditions.push('ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections inbox_pc WHERE inbox_pc.paper_id = p.id)');
+    if (view === 'focus') {
+      conditions.push("(ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?)");
+      values.push(focusThreshold(db));
+    }
   }
 
   if (filters.q) {
@@ -438,7 +457,7 @@ export function listPapers(db, filters = {}) {
     values.push(filters.since);
   }
 
-  const sortColumn = filters.sort === 'updated' || (!filters.sort && view === 'inbox')
+  const sortColumn = filters.sort === 'updated' || (!filters.sort && ['focus', 'inbox'].includes(view))
     ? 'COALESCE(p.updated_at, p.announced_at, ups.inbox_activity_at)'
     : timeColumn;
   const limit = Math.min(Math.max(Number(filters.limit) || 100, 1), 500);
@@ -476,14 +495,26 @@ export function listPapers(db, filters = {}) {
 }
 
 export function getStats(db) {
+  const threshold = focusThreshold(db);
   const active = db.prepare(`
     SELECT
       COUNT(*) AS total,
       COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS inbox,
       COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.is_read = 0 AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS unread,
-      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.unread_reason = 'updated' AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS updated
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.unread_reason = 'updated' AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS updated,
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 1
+        AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id)
+        AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?) THEN 1 ELSE 0 END), 0) AS focus,
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.is_read = 0
+        AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id)
+        AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?) THEN 1 ELSE 0 END), 0) AS focus_unread,
+      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.unread_reason = 'updated'
+        AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id)
+        AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?) THEN 1 ELSE 0 END), 0) AS focus_updated
     FROM user_paper_states ups
-  `).get();
+    JOIN papers p ON p.id = ups.paper_id
+    LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version
+  `).get(threshold, threshold, threshold);
   return {
     ...active,
     archived: Number(db.prepare(`
@@ -584,6 +615,20 @@ export function enqueueUnprocessedInboxAnalyses(db) {
       AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)
     ORDER BY ups.inbox_activity_at DESC, p.id
   `).all().map((row) => row.id);
+  return enqueuePaperAnalyses(db, ids, 'auto');
+}
+
+export function enqueueUnprocessedFocusAnalyses(db) {
+  const ids = db.prepare(`
+    SELECT p.id FROM papers p
+    JOIN user_paper_states ups ON ups.paper_id = p.id
+    LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version
+    LEFT JOIN paper_ai_analyses paa ON paa.paper_id = p.id AND paa.paper_version = p.latest_version
+    WHERE ups.in_inbox = 1 AND paa.paper_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)
+      AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?)
+    ORDER BY ups.inbox_activity_at DESC, p.id
+  `).all(focusThreshold(db)).map((row) => row.id);
   return enqueuePaperAnalyses(db, ids, 'auto');
 }
 

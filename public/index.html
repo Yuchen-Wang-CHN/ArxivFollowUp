@@ -17,8 +17,11 @@
       </div>
 
       <nav class="primary-nav" aria-label="Main navigation">
-        <button class="nav-item active" data-view="inbox">
-          <span class="nav-icon">⌂</span><span>Inbox</span><span class="nav-count" id="inbox-count" title="Inbox 中的未读论文数">0</span>
+        <button class="nav-item active" data-view="focus">
+          <span class="nav-icon">◎</span><span>Focus Inbox</span><span class="nav-count" id="focus-count" title="Focus Inbox 中的未读论文数">0</span>
+        </button>
+        <button class="nav-item" data-view="inbox">
+          <span class="nav-icon">≡</span><span>All Papers</span><span class="nav-count" id="all-papers-count" title="尚未处理的全部论文数">0</span>
         </button>
         <button class="nav-item" data-view="collections"><span class="nav-icon">◇</span><span>Collections</span></button>
         <button class="nav-item" data-view="archive"><span class="nav-icon">□</span><span>Archive</span></button>
@@ -36,7 +39,7 @@
       <header class="topbar">
         <div>
           <p class="eyebrow" id="view-eyebrow">YOUR RESEARCH QUEUE</p>
-          <h1 id="view-title">Inbox</h1>
+          <h1 id="view-title">Focus Inbox</h1>
         </div>
         <div class="topbar-actions">
           <span class="sync-status" id="sync-status">Not synced yet</span>
@@ -79,7 +82,7 @@
             </select>
             <select id="sort-filter" aria-label="Sort">
               <option value="updated">Latest version time</option>
-              <option value="activity">Recent Inbox activity</option>
+              <option value="activity">Recent queue activity</option>
             </select>
           </div>
         </div>
@@ -144,6 +147,14 @@
             <p>调整论文列表的垂直空间。</p>
             <select id="display-density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select>
           </article>
+          <article class="settings-card">
+            <h3>Focus Inbox</h3>
+            <p>只把高相关论文、版本更新和你主动标记为未读的论文放入 Focus；其余论文仍保留在 All Papers。</p>
+            <label>Minimum relevance score
+              <input id="focus-threshold" type="number" min="-1" max="1" step="0.01" required>
+            </label>
+            <p class="setting-hint" id="focus-threshold-hint"></p>
+          </article>
           <article class="settings-card ai-settings-card">
             <h3>LLM analysis</h3>
             <p>生成中文摘要与一句话解读。LLM 与 Embedding 使用互相独立的 API。</p>
@@ -174,7 +185,7 @@
           </article>
           <article class="settings-card ai-settings-card">
             <h3>Embedding & classification</h3>
-            <p>为当前保留的论文生成向量，并根据 Collection 样本预测默认类别。Archive 不参与相似度计算。</p>
+            <p>为当前保留的论文生成向量，并根据 Collection 样本预测默认类别。预测分数同时用于 Focus Inbox；Archive 不参与相似度计算。</p>
             <form id="embedding-settings-form" class="ai-settings-form">
               <label>Mode
                 <select id="embedding-mode">

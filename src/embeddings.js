@@ -16,13 +16,14 @@ function normalizeBaseUrl(value) {
 export function getEmbeddingConfiguration(db, { includeApiKey = false } = {}) {
   const settings = getSettings(db);
   const savedApiKey = getSecret(db, 'embedding_api_key');
+  const configuredThreshold = Number(settings.classification_threshold);
   const configuration = {
     mode: settings.embedding_processing_mode ?? 'off',
     baseUrl: settings.embedding_base_url,
     model: settings.embedding_model,
     batchSize: Math.min(Math.max(Number(settings.embedding_batch_size) || 32, 1), 256),
     timeoutSeconds: Math.min(Math.max(Number(settings.embedding_request_timeout_seconds) || 120, 10), 600),
-    threshold: Math.min(Math.max(Number(settings.classification_threshold) || 0.65, -1), 1),
+    threshold: Number.isFinite(configuredThreshold) ? Math.min(Math.max(configuredThreshold, -1), 1) : 0.55,
     margin: Math.min(Math.max(Number(settings.classification_margin) || 0.03, 0), 2),
     archiveColor: settings.archive_color ?? '#64748b',
     apiKeyConfigured: Boolean(savedApiKey || EMBEDDING_API_KEY),
@@ -423,7 +424,8 @@ export function createEmbeddingCoordinator(db, options = {}) {
     }
     if (classificationRequested) {
       classificationRequested = false;
-      classifyPapers(db, config);
+      const result = classifyPapers(db, config);
+      options.onClassificationChanged?.(result);
     }
     schedule(1_000);
   };

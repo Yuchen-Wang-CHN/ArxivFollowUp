@@ -34,6 +34,20 @@ test('serves bootstrap and validates local mutation header', async (context) => 
   const savedSettings = (await allowed.json()).settings;
   assert.equal(savedSettings.refresh_interval_days, '7');
   assert.equal(savedSettings.open_browser_on_start, '0');
+
+  const focusResponse = await fetch(`http://127.0.0.1:${port}/api/settings`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' }, body: JSON.stringify({ focusThreshold: 0.61 }),
+  });
+  const focusPayload = await focusResponse.json();
+  assert.equal(focusResponse.status, 200);
+  assert.equal(focusPayload.settings.focus_threshold, '0.61');
+  assert.equal(focusPayload.settings.classification_threshold, '0.55');
+  assert.equal(focusPayload.stats.focus, 0);
+
+  const invalidFocus = await fetch(`http://127.0.0.1:${port}/api/settings`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' }, body: JSON.stringify({ focusThreshold: 0.5 }),
+  });
+  assert.equal(invalidFocus.status, 400);
 });
 
 test('paper API accepts repeated category and category-group filters', async (context) => {

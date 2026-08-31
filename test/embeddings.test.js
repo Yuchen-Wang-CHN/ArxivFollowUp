@@ -37,6 +37,7 @@ test('embedding worker batches papers, sends its own API key, and classifies Inb
   setSecret(db, 'embedding_api_key', 'embedding-secret');
   let authorization;
   let requestBody;
+  let classificationCallbackCount = 0;
   const vectors = new Map([
     ['Archived seed', [1, 0]],
     ['Agent seed', [0, 1]],
@@ -44,6 +45,7 @@ test('embedding worker batches papers, sends its own API key, and classifies Inb
     ['Likely agent', [0.05, 0.99]],
   ]);
   const coordinator = createEmbeddingCoordinator(db, {
+    onClassificationChanged: () => { classificationCallbackCount += 1; },
     fetchImpl: async (_url, options) => {
       authorization = options.headers.Authorization;
       requestBody = JSON.parse(options.body);
@@ -68,6 +70,7 @@ test('embedding worker batches papers, sends its own API key, and classifies Inb
   assert.equal(authorization, 'Bearer embedding-secret');
   assert.equal(requestBody.model, 'Qwen/Qwen3-Embedding-0.6B');
   assert.equal(requestBody.input.length, 4);
+  assert.ok(classificationCallbackCount > 0);
   assert.deepEqual(db.prepare(`
     SELECT paper_id, target_type, target_collection_id FROM paper_classifications ORDER BY paper_id
   `).all().map((row) => ({ ...row })), [

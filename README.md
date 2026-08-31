@@ -1,8 +1,8 @@
 # ArxivFollowUp (AFU)
 
-把 arXiv 新论文和版本更新送进一个本地 Inbox，并用中文解读帮助你快速判断哪些值得读。
+完整保存 arXiv 新论文和版本更新，再把与你兴趣最相关的内容送进一个本地 Focus Inbox。
 
-ArxivFollowUp 是一款本地运行的 arXiv 论文追踪工具。订阅 `cs.AI`、`cs.LG` 等 Category 后，新论文会进入统一的阅读队列；已经处理过的论文如果出现更高版本，也会重新回到 Inbox，避免重要更新悄悄溜走。
+ArxivFollowUp 是一款本地运行的 arXiv 论文追踪工具。订阅 `cs.AI`、`cs.LG` 等 Category 后，完整抓取结果会保留在 All Papers，Embedding 会把高相关论文送进 Focus Inbox；已经处理过的论文如果出现更高版本，也会重新进入 Focus，避免重要更新悄悄溜走。
 
 连接任意 OpenAI-compatible API 后，AFU 还能为论文生成一句话中文解读和摘要翻译。订阅、论文元数据、阅读状态、收藏夹和 AI 结果均保存在本地 SQLite 中，不需要账户或云端数据库。
 
@@ -15,7 +15,7 @@ ArxivFollowUp 是一款本地运行的 arXiv 论文追踪工具。订阅 `cs.AI`
 - 按 arXiv Category 订阅研究方向
 - 增量发现新论文和更高版本，并按 arXiv ID 自动去重
 - 保存本地实际观察到的版本历史
-- 已归档论文出现新版本时重新进入 Inbox
+- 已归档论文出现新版本时重新进入 Focus Inbox
 
 ### 用 AI 快速判断是否值得读
 
@@ -24,11 +24,12 @@ ArxivFollowUp 是一款本地运行的 arXiv 论文追踪工具。订阅 `cs.AI`
 - 可自动处理新论文，也可只分析手动选中的论文
 - 支持自定义 OpenAI-compatible API、模型和并发数
 
-### 用 Embedding 预分类 Inbox
+### 用 Embedding 构建 Focus Inbox
 
 - LLM 分析与 Embedding 可分别配置 API、模型和密钥
 - 根据 Collection 中的论文学习你的兴趣分类
-- 在 Inbox 中显示预测类别，帮助你优先浏览可能感兴趣的论文
+- 通过可调相关度门槛，把高相关论文送进 Focus Inbox
+- 在论文卡片中显示预测类别，帮助你理解入选原因
 - 可为 Collection 和 Archive 设置颜色；预测标签不会改变论文所在位置
 
 AI 完全可选。关闭后，订阅、同步和阅读管理仍可正常使用。
@@ -51,10 +52,10 @@ AI 完全可选。关闭后，订阅、同步和阅读管理仍可正常使用�
 ## 使用方式
 
 1. 在 **Subscriptions** 中添加想追踪的 arXiv Category。
-2. AFU 同步当前 RSS，并将新论文放入 **Inbox**。
-3. 浏览标题和 AI 一句话解读，展开卡片查看原文或双语摘要。
+2. AFU 同步当前 RSS，将完整结果保留在 **All Papers**，并把高相关论文送入 **Focus Inbox**。
+3. 优先浏览 Focus 中的标题和 AI 一句话解读，必要时到 All Papers 搜索完整结果。
 4. 将论文标为已读、加入 Collection，或在处理完成后 Archive。
-5. 后续同步发现更高版本时，论文会再次出现在 Inbox 并标记为 Updated。
+5. 后续同步发现更高版本时，论文会再次出现在 Focus Inbox 并标记为 Updated。
 
 ## 快速开始
 
@@ -93,8 +94,8 @@ npm start
 例如，可以使用 Qwen3.8 27B 等支持 OpenAI-compatible API 的模型。
 
 - **关闭**：不创建新任务，但继续显示已有结果
-- **自动**：自动分析 Inbox 中的新论文和新版本
-- **手动**：只分析在 Inbox 中勾选并提交的论文
+- **自动**：Embedding 分类完成后，只自动分析进入 Focus 的新论文和新版本
+- **手动**：只分析在 Focus 或 All Papers 中勾选并提交的论文
 
 也可以在启动前通过环境变量提供默认配置：
 
@@ -124,7 +125,9 @@ Base URL  http://127.0.0.1:8001/v1
 Model     Qwen/Qwen3-Embedding-0.6B
 ```
 
-启用后，AFU 会为本地论文生成 Embedding，并根据各个 Collection 中的论文建立兴趣分类。预测结果足够明确时，Inbox 卡片会显示对应的彩色标签。你可以在 Settings 中调整最低分数和领先幅度（Winning margin）；Collection 内容变化后，分类会自动更新。
+启用后，AFU 会为本地论文生成 Embedding，并根据各个 Collection 中的论文建立兴趣分类。预测结果足够明确时，论文卡片会显示对应的彩色标签。你可以在 Settings 中分别调整分类门槛、领先幅度（Winning margin）和 Focus 最低相关度；Collection 内容变化后，分类会自动更新。
+
+Focus Inbox 默认最低相关度为 `0.60`，分类门槛默认为 `0.55`；Focus 门槛不能低于分类门槛。版本更新和你主动标记为未读的论文不受门槛限制；未进入 Focus 的论文不会丢失，仍可在 All Papers 中搜索和处理。
 
 Archive 中的论文不会参与分类。预测标签仅用于辅助浏览，不会自动移动或归档论文。
 
@@ -140,7 +143,7 @@ Embedding 服务也可以通过环境变量提供默认值：
 
 AFU 通过 arXiv RSS 持续发现新论文和版本更新，从你添加订阅时开始追踪。自动同步间隔可设置为 1–7 天，也可以随时点击 **Sync now**。
 
-Archive 会将论文移出 Inbox，但保留论文信息、版本历史和 AI 结果。若确定不再需要，可以在 Archive 中选择“删除本地内容”。以后出现更高版本时，这篇论文仍会作为 **Updated** 重新进入 Inbox。
+Archive 会将论文移出 Focus 和 All Papers，但保留论文信息、版本历史和 AI 结果。若确定不再需要，可以在 Archive 中选择“删除本地内容”。以后出现更高版本时，这篇论文仍会作为 **Updated** 重新进入 Focus。
 
 AFU 不下载 PDF；论文信息、阅读状态、AI 结果和 Embedding 都保存在本地 SQLite 中。
 

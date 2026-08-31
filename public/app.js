@@ -1,5 +1,5 @@
 const state = {
-  view: 'inbox',
+  view: 'focus',
   bootstrap: null,
   papers: [],
   selected: new Set(),
@@ -60,6 +60,8 @@ const elements = {
   retryFailedAi: document.querySelector('#retry-failed-ai'),
   embeddingServiceStatus: document.querySelector('#embedding-service-status'),
   retryFailedEmbeddings: document.querySelector('#retry-failed-embeddings'),
+  focusThreshold: document.querySelector('#focus-threshold'),
+  focusThresholdHint: document.querySelector('#focus-threshold-hint'),
 };
 
 function escapeHtml(value) {
@@ -142,7 +144,22 @@ function setLoading(loading) {
 function updateStats(stats) {
   if (!state.bootstrap) return;
   state.bootstrap.stats = stats;
-  document.querySelector('#inbox-count').textContent = stats.unread ?? 0;
+  document.querySelector('#focus-count').textContent = stats.focus_unread ?? 0;
+  document.querySelector('#all-papers-count').textContent = stats.inbox ?? 0;
+  updateFocusThresholdHint();
+}
+
+function updateFocusThresholdHint() {
+  if (!elements.focusThresholdHint || !state.bootstrap) return;
+  const focus = Number(state.bootstrap.stats?.focus ?? 0);
+  const all = Number(state.bootstrap.stats?.inbox ?? 0);
+  const reduction = all > 0 ? Math.round((1 - focus / all) * 100) : 0;
+  elements.focusThresholdHint.textContent = `${focus} / ${all} 篇论文当前进入 Focus${all ? ` · 减少 ${reduction}%` : ''}`;
+}
+
+function updateFocusThresholdConstraint() {
+  if (!elements.focusThreshold || !state.bootstrap) return;
+  elements.focusThreshold.min = state.bootstrap.settings.classification_threshold ?? '-1';
 }
 
 function updateSyncStatus() {
@@ -214,7 +231,7 @@ function renderPaperCategoryFilters() {
           </label>`).join('')}
         </div>
       </section>`;
-    }).join('') : '<p class="category-filter-empty">No categories in Inbox</p>'}`;
+    }).join('') : '<p class="category-filter-empty">No categories in this view</p>'}`;
   elements.categoryFilterMenu.querySelectorAll('[data-category-group]').forEach((checkbox) => {
     const group = groups.find((item) => item.code === checkbox.dataset.categoryGroup);
     checkbox.indeterminate = !checkbox.checked && group.categories.some((category) => state.selectedCategories.has(category.code));
@@ -329,7 +346,7 @@ function paperCard(paper) {
   const extraCategories = paper.categories.length > 4 ? `<span>+${paper.categories.length - 4}</span>` : '';
   const densityClass = state.bootstrap.settings.display_density === 'compact' ? 'compact' : '';
   const action = state.view === 'archive' ? 'inbox' : 'archive';
-  const actionLabel = state.view === 'archive' ? 'Move to inbox' : 'Archive';
+  const actionLabel = state.view === 'archive' ? 'Move to Focus' : 'Archive';
   const displayedDate = paper.updated_at ?? paper.announced_at;
   const displayedDateLabel = paper.updated_at ? 'Updated' : 'Announced';
   const abstractMode = state.bootstrap.settings.abstract_display_mode ?? 'original';
@@ -397,8 +414,10 @@ function renderPapers() {
     || elements.updatedFilter.value
     || elements.timeFilter.value
   );
-  const viewTotal = state.view === 'inbox'
-    ? Number(state.bootstrap.stats.inbox ?? 0)
+  const viewTotal = state.view === 'focus'
+    ? Number(state.bootstrap.stats.focus ?? 0)
+    : state.view === 'inbox'
+      ? Number(state.bootstrap.stats.inbox ?? 0)
     : state.view === 'archive'
       ? Number(state.bootstrap.stats.archived ?? 0)
       : Number(state.bootstrap.collections.find((collection) => Number(collection.id) === Number(state.collectionId))?.paper_count ?? 0);
@@ -412,8 +431,10 @@ function renderPapers() {
   elements.nextPage.disabled = !state.hasMorePapers;
   elements.pageLabel.textContent = `Page ${state.paperPage + 1}`;
   if (!state.papers.length) {
-    const copy = state.view === 'inbox'
-      ? ['Inbox is clear', '新增论文和版本更新会出现在这里。']
+    const copy = state.view === 'focus'
+      ? ['Focus Inbox is clear', '高相关论文、版本更新和你主动标记为未读的论文会出现在这里。完整抓取结果仍保留在 All Papers。']
+      : state.view === 'inbox'
+        ? ['All Papers is clear', '同步发现的全部候选论文会保留在这里。']
       : state.view === 'archive'
         ? ['Nothing archived', '不感兴趣的论文会保留在这里，直到你明确删除本地内容。']
         : ['Collection is empty', '把论文加入收藏夹后会显示在这里。'];
@@ -522,7 +543,7 @@ function ensureEmbeddingPolling() {
       state.bootstrap.embeddings = payload;
       updateEmbeddingStatusText(payload);
       const currentWork = Number(payload.pending ?? 0) + Number(payload.running ?? payload.active ?? 0);
-      if (previousWork > 0 && currentWork === 0 && ['inbox', 'archive', 'collections'].includes(state.view)) await loadPapers();
+      if (previousWork > 0 && currentWork === 0 && ['focus', 'inbox', 'archive', 'collections'].includes(state.view)) await loadPapers();
     } catch {}
     ensureEmbeddingPolling();
   }, 2_000);
@@ -548,7 +569,7 @@ function currentPaperFilters({ offset = 0, limit = PAPER_PAGE_SIZE + 1 } = {}) {
 
 async function loadPapers({ resetPage = false } = {}) {
   if (resetPage) state.paperPage = 0;
-  if (!['inbox', 'archive', 'collections'].includes(state.view)) return;
+  if (!['focus', 'inbox', 'archive', 'collections'].includes(state.view)) return;
   if (state.view === 'collections' && !state.collectionId) {
     state.papers = [];
     state.hasMorePapers = false;
@@ -603,7 +624,7 @@ function renderSubscriptions() {
 }
 
 function showPage(view) {
-  elements.paperWorkspace.classList.toggle('hidden', !['inbox', 'archive', 'collections'].includes(view));
+  elements.paperWorkspace.classList.toggle('hidden', !['focus', 'inbox', 'archive', 'collections'].includes(view));
   elements.subscriptionsPage.classList.toggle('hidden', view !== 'subscriptions');
   elements.collectionsPage.classList.toggle('hidden', view !== 'collections');
   elements.settingsPage.classList.toggle('hidden', view !== 'settings');
@@ -615,11 +636,12 @@ async function navigate(view) {
   state.view = view;
   state.paperPage = 0;
   state.selected.clear();
-  if (['inbox', 'archive', 'collections'].includes(view)) {
-    elements.sortFilter.value = view === 'inbox' ? 'updated' : 'activity';
+  if (['focus', 'inbox', 'archive', 'collections'].includes(view)) {
+    elements.sortFilter.value = ['focus', 'inbox'].includes(view) ? 'updated' : 'activity';
   }
   const headings = {
-    inbox: ['YOUR RESEARCH QUEUE', 'Inbox'],
+    focus: ['YOUR RESEARCH QUEUE', 'Focus Inbox'],
+    inbox: ['COMPLETE CAPTURE', 'All Papers'],
     archive: ['PROCESSED PAPERS', 'Archive'],
     collections: ['SAVED FOR LATER', 'Collections'],
     subscriptions: ['TRACK BY CATEGORY', 'Subscriptions'],
@@ -632,7 +654,7 @@ async function navigate(view) {
     renderCollectionControls();
     renderCollectionsManager();
     await loadPapers();
-  } else if (['inbox', 'archive'].includes(view)) await loadPapers();
+  } else if (['focus', 'inbox', 'archive'].includes(view)) await loadPapers();
 }
 
 function updateSelectionUi() {
@@ -683,7 +705,7 @@ async function runSync(subscriptionId = null) {
     updateSyncStatus();
     updateDueBanner();
     renderSubscriptions();
-    if (['inbox', 'archive', 'collections'].includes(state.view)) await loadPapers();
+    if (['focus', 'inbox', 'archive', 'collections'].includes(state.view)) await loadPapers();
     state.latestSyncRunId = Number(payload.latestSyncRunId ?? state.latestSyncRunId);
     toast(`${changes.newCount} new · ${changes.updatedCount} updated${changes.failedCount ? ` · ${changes.failedCount} failed` : ''}`, changes.failedCount ? 'error' : 'success');
   } catch (error) {
@@ -997,6 +1019,20 @@ document.querySelector('#open-browser-on-start').addEventListener('change', asyn
     toast('Startup browser preference saved');
   } catch (error) { toast(error.message, 'error'); }
 });
+elements.focusThreshold.addEventListener('change', async (event) => {
+  try {
+    const payload = await api('/api/settings', { method: 'PATCH', body: { focusThreshold: Number(event.target.value) } });
+    state.bootstrap.settings = payload.settings;
+    event.target.value = payload.settings.focus_threshold;
+    document.querySelector('#classification-threshold').value = payload.settings.classification_threshold;
+    updateStats(payload.stats);
+    if (['focus', 'inbox'].includes(state.view)) await loadPapers({ resetPage: true });
+    toast('Focus threshold saved');
+  } catch (error) {
+    event.target.value = state.bootstrap.settings.focus_threshold;
+    toast(error.message, 'error');
+  }
+});
 document.querySelector('#ai-settings-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const button = event.submitter;
@@ -1025,7 +1061,7 @@ document.querySelector('#ai-settings-form').addEventListener('submit', async (ev
     updateAiStatusText(payload);
     updateSelectionUi();
     renderPapers();
-    toast(payload.backfill?.queued ? `AI settings saved · queued ${payload.backfill.queued} Inbox papers` : 'AI settings saved');
+    toast(payload.backfill?.queued ? `AI settings saved · queued ${payload.backfill.queued} Focus papers` : 'AI settings saved');
   } catch (error) { toast(error.message, 'error'); }
   finally { if (button) button.disabled = false; }
 });
@@ -1067,7 +1103,11 @@ document.querySelector('#embedding-settings-form').addEventListener('submit', as
       },
     });
     state.bootstrap.embeddings = payload;
+    state.bootstrap.settings = payload.settings ?? state.bootstrap.settings;
     state.bootstrap.settings.archive_color = payload.archiveColor;
+    elements.focusThreshold.value = state.bootstrap.settings.focus_threshold;
+    updateFocusThresholdConstraint();
+    if (payload.stats) updateStats(payload.stats);
     document.querySelector('#embedding-api-key').value = '';
     document.querySelector('#embedding-clear-api-key').checked = false;
     updateEmbeddingStatusText(payload);
@@ -1143,6 +1183,9 @@ async function boot() {
     document.querySelector('#refresh-days').value = state.bootstrap.settings.refresh_interval_days;
     document.querySelector('#display-density').value = state.bootstrap.settings.display_density;
     document.querySelector('#open-browser-on-start').checked = state.bootstrap.settings.open_browser_on_start !== '0';
+    elements.focusThreshold.value = state.bootstrap.settings.focus_threshold ?? '0.60';
+    updateFocusThresholdConstraint();
+    updateFocusThresholdHint();
     document.querySelector('#ai-mode').value = state.bootstrap.ai.mode;
     document.querySelector('#ai-base-url').value = state.bootstrap.ai.baseUrl;
     document.querySelector('#ai-model').value = state.bootstrap.ai.model;
@@ -1159,7 +1202,7 @@ async function boot() {
     document.querySelector('#archive-color').value = safeColor(state.bootstrap.embeddings.archiveColor);
     document.querySelector('#embedding-api-key').placeholder = state.bootstrap.embeddings.apiKeyConfigured ? '已保存密钥；留空保持不变' : '可留空（服务无需密钥）';
     updateEmbeddingStatusText(state.bootstrap.embeddings);
-    await navigate('inbox');
+    await navigate('focus');
     if (state.bootstrap.categoriesNeedRefresh) {
       api('/api/categories/refresh', { method: 'POST' }).then((payload) => {
         state.bootstrap.categories = payload.categories;

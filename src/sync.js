@@ -1,6 +1,6 @@
 import { REQUEST_INTERVAL_MS } from './config.js';
 import { fetchCategoryFeed, fetchPaperMetadata } from './arxiv.js';
-import { enqueuePaperAnalyses, getSettings, transaction } from './db.js';
+import { enqueueUnprocessedFocusAnalyses, getSettings, transaction } from './db.js';
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -194,7 +194,7 @@ export function syncSubscriptions(db, subscriptions, options = {}) {
       const metadata = await enrichPaperDatesInternal(db, [...new Set([...newIds, ...updatedIds])], options);
       let ai = null;
       if (getSettings(db).ai_processing_mode === 'auto' && (newIds.size || updatedIds.size)) {
-        ai = enqueuePaperAnalyses(db, [...new Set([...newIds, ...updatedIds])], 'auto');
+        ai = enqueueUnprocessedFocusAnalyses(db);
       }
       const status = failedCount === 0 ? 'success' : failedCount === results.length ? 'error' : 'partial';
       db.prepare(`

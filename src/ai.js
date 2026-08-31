@@ -1,5 +1,5 @@
 import { AI_API_KEY } from './config.js';
-import { enqueueUnprocessedInboxAnalyses, getAiQueueStatus, getSecret, getSettings, transaction } from './db.js';
+import { enqueueUnprocessedFocusAnalyses, getAiQueueStatus, getSecret, getSettings, transaction } from './db.js';
 
 const PROMPT_VERSION = 1;
 const MAX_ATTEMPTS = 3;
@@ -171,7 +171,7 @@ function saveFailure(db, job, error) {
 
 export function createAiCoordinator(db, options = {}) {
   recoverInterruptedJobs(db);
-  if (getAiConfiguration(db).mode === 'auto') enqueueUnprocessedInboxAnalyses(db);
+  if (getAiConfiguration(db).mode === 'auto') enqueueUnprocessedFocusAnalyses(db);
   const active = new Map();
   let timer = null;
   let stopped = false;

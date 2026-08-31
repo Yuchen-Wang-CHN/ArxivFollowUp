@@ -105,6 +105,32 @@ test('Inbox defaults to arXiv update time and supports hierarchical category mul
   db.close();
 });
 
+test('Focus keeps high-relevance predictions and explicit follow-ups without removing All Papers', () => {
+  const { db, subscription } = setup();
+  const now = '2026-08-21T00:00:00.000Z';
+  ingestFeed(db, subscription, { errors: [], papers: [
+    item(1, { id: '2608.30001', title: 'High relevance', categories: ['cs.AI'] }),
+    item(1, { id: '2608.30002', title: 'Below threshold', categories: ['stat.ML'] }),
+    item(1, { id: '2608.30003', title: 'Version follow-up', categories: ['cs.CL'] }),
+  ] }, now);
+  const favorites = db.prepare("SELECT id FROM collections WHERE name = 'Favorites'").get();
+  const insertPrediction = db.prepare(`
+    INSERT INTO paper_classifications (
+      paper_id, paper_version, target_type, target_collection_id, score, second_score,
+      threshold, model, profile_hash, classified_at
+    ) VALUES (?, 1, 'collection', ?, ?, NULL, 0.55, 'test-model', 'profile', ?)
+  `);
+  insertPrediction.run('2608.30001', favorites.id, 0.72, now);
+  insertPrediction.run('2608.30002', favorites.id, 0.58, now);
+  db.prepare("UPDATE user_paper_states SET unread_reason = 'updated' WHERE paper_id = '2608.30003'").run();
+
+  assert.deepEqual(listPapers(db, { view: 'focus' }).map((paper) => paper.id).sort(), ['2608.30001', '2608.30003']);
+  assert.equal(listPapers(db, { view: 'inbox' }).length, 3);
+  assert.deepEqual({ focus: getStats(db).focus, inbox: getStats(db).inbox }, { focus: 2, inbox: 3 });
+  assert.deepEqual(listInboxCategoryGroups(db, { view: 'focus' }).flatMap((group) => group.categories.map((category) => category.code)).sort(), ['cs.AI', 'cs.CL', 'cs.LG']);
+  db.close();
+});
+
 test('metadata enrichment stores real published and latest-version dates', async () => {
   const { db, subscription } = setup();
   ingestFeed(db, subscription, { papers: [item(2)], errors: [] });
@@ -156,7 +182,7 @@ test('restore accepts backups created before the ArxivFollowUp rename', () => {
   fs.rmSync(backupDirectory, { recursive: true, force: true });
 });
 
-test('auto AI mode queues newly synchronized papers without blocking sync', async () => {
+test('auto AI mode waits for Focus classification without blocking sync', async () => {
   const { db, subscription } = setup();
   setSetting(db, 'ai_processing_mode', 'auto');
   const result = await syncSubscriptions(db, [subscription], {
@@ -164,8 +190,8 @@ test('auto AI mode queues newly synchronized papers without blocking sync', asyn
     fetchMetadata: async () => [],
   });
   assert.equal(result.status, 'success');
-  assert.equal(result.ai.queued, 1);
-  assert.equal(getAiQueueStatus(db).pending, 1);
+  assert.equal(result.ai.queued, 0);
+  assert.equal(getAiQueueStatus(db).pending, 0);
   db.close();
 });
 
