@@ -70,11 +70,11 @@ function authorizationHeaders(apiKey) {
   return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 }
 
-async function callEmbeddingApi(config, papers, fetchImpl = fetch) {
+async function callEmbeddingInputs(config, inputs, fetchImpl = fetch) {
   const response = await fetchImpl(`${normalizeBaseUrl(config.baseUrl)}/embeddings`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authorizationHeaders(config.apiKey) },
-    body: JSON.stringify({ model: config.model, input: papers.map(embeddingInput) }),
+    body: JSON.stringify({ model: config.model, input: inputs }),
     signal: AbortSignal.timeout(config.timeoutSeconds * 1_000),
   });
   if (!response.ok) {
@@ -87,11 +87,22 @@ async function callEmbeddingApi(config, papers, fetchImpl = fetch) {
   }
   const payload = await response.json();
   const ordered = [...(payload.data ?? [])].sort((left, right) => Number(left.index) - Number(right.index));
-  if (ordered.length !== papers.length) throw new Error(`Embedding response returned ${ordered.length} vectors for ${papers.length} papers.`);
+  if (ordered.length !== inputs.length) throw new Error(`Embedding response returned ${ordered.length} vectors for ${inputs.length} inputs.`);
   const vectors = ordered.map((item) => normalizeVector(item.embedding));
   const dimensions = vectors[0].length;
   if (vectors.some((vector) => vector.length !== dimensions)) throw new Error('Embedding response contains inconsistent dimensions.');
   return { vectors, dimensions };
+}
+
+async function callEmbeddingApi(config, papers, fetchImpl = fetch) {
+  return callEmbeddingInputs(config, papers.map(embeddingInput), fetchImpl);
+}
+
+export async function embedSearchQuery(db, query, fetchImpl = fetch) {
+  const config = getEmbeddingConfiguration(db, { includeApiKey: true });
+  config.timeoutSeconds = Math.min(config.timeoutSeconds, 15);
+  const result = await callEmbeddingInputs(config, [`Query: ${String(query).trim()}`], fetchImpl);
+  return { vector: result.vectors[0], dimensions: result.dimensions, model: config.model };
 }
 
 export async function testEmbeddingConnection(config, fetchImpl = fetch) {

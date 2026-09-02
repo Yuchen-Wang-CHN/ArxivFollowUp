@@ -56,10 +56,13 @@
 
       <section id="paper-workspace">
         <div class="workspace-tools">
-          <label class="search-box">
-            <span>⌕</span>
-            <input id="search-input" type="search" placeholder="Search title, author, abstract, notes or arXiv ID" autocomplete="off">
-          </label>
+          <form class="search-box" id="search-form" role="search">
+            <label>
+              <span>⌕</span>
+              <input id="search-input" type="search" placeholder="Describe papers to find, or enter exact terms" autocomplete="off">
+            </label>
+            <button class="button search-submit" type="submit">Search</button>
+          </form>
           <div class="filter-row">
             <details class="category-multiselect" id="category-filter">
               <summary aria-label="Category filter"><span id="category-filter-label">All categories</span></summary>
@@ -86,6 +89,7 @@
             </select>
           </div>
         </div>
+        <p class="search-mode-status hidden" id="search-mode-status" aria-live="polite"></p>
 
         <div class="collection-strip hidden" id="collection-strip"></div>
 
@@ -212,6 +216,17 @@
               </div>
             </form>
             <p class="ai-service-status" id="embedding-service-status"></p>
+          </article>
+          <article class="settings-card">
+            <h3>Hybrid search</h3>
+            <p>自然语言搜索融合本地 BM25 与 Dense 相似度。Embedding 关闭或不可用时自动使用 100% BM25。</p>
+            <form id="search-settings-form">
+              <label>Dense weight · <output id="search-dense-weight-value">60%</output>
+                <input id="search-dense-weight" type="range" min="0" max="100" step="5" value="60">
+              </label>
+              <p class="setting-hint" id="search-weight-hint">BM25 40% · Dense 60%</p>
+              <button class="button" type="submit">Save search settings</button>
+            </form>
           </article>
           <article class="settings-card">
             <h3>Abstract display</h3>

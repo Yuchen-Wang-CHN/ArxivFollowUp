@@ -62,6 +62,39 @@ test('an update to an already unread paper remains ordinary unread', () => {
   db.close();
 });
 
+test('only updates to read or collected papers bypass the Focus threshold', () => {
+  const { db, subscription } = setup();
+  const ids = {
+    unread: '2608.40001', read: '2608.40002', collected: '2608.40003', archived: '2608.40004',
+  };
+  ingestFeed(db, subscription, { errors: [], papers: Object.entries(ids).map(([label, id]) => item(1, {
+    id, title: `${label} paper`, categories: ['cs.AI'],
+  })) }, '2026-08-20T00:00:00.000Z');
+
+  db.prepare('UPDATE user_paper_states SET is_read = 1, unread_reason = NULL WHERE paper_id = ?').run(ids.read);
+  const favorites = db.prepare("SELECT id FROM collections WHERE name = 'Favorites'").get();
+  db.prepare('INSERT INTO paper_collections (paper_id, collection_id, added_at) VALUES (?, ?, ?)')
+    .run(ids.collected, favorites.id, '2026-08-20T01:00:00.000Z');
+  db.prepare('UPDATE user_paper_states SET in_inbox = 0 WHERE paper_id = ?').run(ids.collected);
+  db.prepare('UPDATE user_paper_states SET in_inbox = 0, focus_override = 0, archived_version = 1, archived_at = ? WHERE paper_id = ?')
+    .run('2026-08-20T01:00:00.000Z', ids.archived);
+
+  ingestFeed(db, subscription, { errors: [], papers: Object.entries(ids).map(([label, id]) => item(2, {
+    id, title: `${label} paper v2`, categories: ['cs.AI'],
+  })) }, '2026-08-21T00:00:00.000Z');
+
+  assert.deepEqual(listPapers(db, { view: 'focus' }).map((paper) => paper.id).sort(), [ids.collected, ids.read].sort());
+  assert.deepEqual(listPapers(db, { view: 'inbox' }).map((paper) => paper.id).sort(), [ids.archived, ids.read, ids.unread].sort());
+  assert.deepEqual({ focus: getStats(db).focus, focusUpdated: getStats(db).focus_updated }, { focus: 2, focusUpdated: 2 });
+  assert.deepEqual(db.prepare('SELECT paper_id, focus_override FROM user_paper_states ORDER BY paper_id').all().map((row) => ({ ...row })), [
+    { paper_id: ids.unread, focus_override: 0 },
+    { paper_id: ids.read, focus_override: 1 },
+    { paper_id: ids.collected, focus_override: 1 },
+    { paper_id: ids.archived, focus_override: 0 },
+  ]);
+  db.close();
+});
+
 test('paper queries support stable pagination beyond the first 100 rows', () => {
   const { db, subscription } = setup();
   const papers = Array.from({ length: 205 }, (_, index) => item(1, {
@@ -122,7 +155,7 @@ test('Focus keeps high-relevance predictions and explicit follow-ups without rem
   `);
   insertPrediction.run('2608.30001', favorites.id, 0.72, now);
   insertPrediction.run('2608.30002', favorites.id, 0.58, now);
-  db.prepare("UPDATE user_paper_states SET unread_reason = 'updated' WHERE paper_id = '2608.30003'").run();
+  db.prepare("UPDATE user_paper_states SET unread_reason = 'updated', focus_override = 1 WHERE paper_id = '2608.30003'").run();
 
   assert.deepEqual(listPapers(db, { view: 'focus' }).map((paper) => paper.id).sort(), ['2608.30001', '2608.30003']);
   assert.equal(listPapers(db, { view: 'inbox' }).length, 3);

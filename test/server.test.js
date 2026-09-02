@@ -225,7 +225,11 @@ test('adding a paper to a collection removes it from Inbox', async (context) => 
     categories: ['cs.AI'], announcedAt: '2026-08-21T00:00:00.000Z', arxivUrl: 'https://arxiv.org/abs/2608.01001',
     pdfUrl: 'https://arxiv.org/pdf/2608.01001v2', announceType: 'replace',
   }] }, '2026-08-21T00:00:00.000Z');
-  assert.equal(db.prepare('SELECT in_inbox FROM user_paper_states WHERE paper_id = ?').get('2608.01001').in_inbox, 0);
+  assert.deepEqual({ ...db.prepare('SELECT in_inbox, unread_reason, focus_override FROM user_paper_states WHERE paper_id = ?').get('2608.01001') }, {
+    in_inbox: 0, unread_reason: 'updated', focus_override: 1,
+  });
+  const collectedFocusResponse = await fetch(`http://127.0.0.1:${port}/api/papers?view=focus`);
+  assert.deepEqual((await collectedFocusResponse.json()).papers.map((paper) => paper.id), ['2608.01001']);
 
   const removeFavoritesResponse = await changeCollection('removeFromCollection', favorites.id);
   assert.equal((await removeFavoritesResponse.json()).stats.inbox, 0);
@@ -308,7 +312,7 @@ test('archiving preserves local content until explicit deletion, then suppresses
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM archived_paper_tombstones').get().count, 0);
   assert.deepEqual({ ...db.prepare('SELECT latest_version FROM papers WHERE id = ?').get(paper.id) }, { latest_version: 2 });
   assert.deepEqual({ ...db.prepare('SELECT unread_reason, in_inbox FROM user_paper_states WHERE paper_id = ?').get(paper.id) }, {
-    unread_reason: 'updated', in_inbox: 1,
+    unread_reason: 'new', in_inbox: 1,
   });
 });
 

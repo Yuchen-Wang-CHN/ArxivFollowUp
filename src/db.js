@@ -34,6 +34,62 @@ function ensureParentDirectory(filePath) {
   if (filePath !== ':memory:') fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
 
+function rebuildPaperSearchIndex(db) {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS paper_search_fts USING fts5(
+      paper_id,
+      title,
+      authors,
+      abstract,
+      categories,
+      note,
+      tokenize = 'porter unicode61'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS papers_search_insert AFTER INSERT ON papers BEGIN
+      INSERT INTO paper_search_fts (paper_id, title, authors, abstract, categories, note)
+      VALUES (new.id, new.title, new.authors, new.abstract, new.categories_json, '');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS papers_search_update
+    AFTER UPDATE OF title, authors, abstract, categories_json ON papers BEGIN
+      DELETE FROM paper_search_fts WHERE paper_id = old.id;
+      INSERT INTO paper_search_fts (paper_id, title, authors, abstract, categories, note)
+      VALUES (new.id, new.title, new.authors, new.abstract, new.categories_json,
+        COALESCE((SELECT note FROM user_paper_states WHERE paper_id = new.id), ''));
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS papers_search_delete AFTER DELETE ON papers BEGIN
+      DELETE FROM paper_search_fts WHERE paper_id = old.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS paper_states_search_insert AFTER INSERT ON user_paper_states BEGIN
+      DELETE FROM paper_search_fts WHERE paper_id = new.paper_id;
+      INSERT INTO paper_search_fts (paper_id, title, authors, abstract, categories, note)
+      SELECT p.id, p.title, p.authors, p.abstract, p.categories_json, COALESCE(new.note, '')
+      FROM papers p WHERE p.id = new.paper_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS paper_states_search_note_update
+    AFTER UPDATE OF note ON user_paper_states BEGIN
+      DELETE FROM paper_search_fts WHERE paper_id = new.paper_id;
+      INSERT INTO paper_search_fts (paper_id, title, authors, abstract, categories, note)
+      SELECT p.id, p.title, p.authors, p.abstract, p.categories_json, COALESCE(new.note, '')
+      FROM papers p WHERE p.id = new.paper_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS paper_states_search_delete AFTER DELETE ON user_paper_states BEGIN
+      DELETE FROM paper_search_fts WHERE paper_id = old.paper_id;
+    END;
+
+    DELETE FROM paper_search_fts;
+    INSERT INTO paper_search_fts (paper_id, title, authors, abstract, categories, note)
+    SELECT p.id, p.title, p.authors, p.abstract, p.categories_json, COALESCE(ups.note, '')
+    FROM papers p
+    LEFT JOIN user_paper_states ups ON ups.paper_id = p.id;
+  `);
+}
+
 export function createDatabase(databasePath = DATABASE_PATH) {
   ensureParentDirectory(databasePath);
   const db = new DatabaseSync(databasePath, { timeout: 5_000 });
@@ -148,6 +204,7 @@ function migrate(db) {
       paper_id TEXT PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
       is_read INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
       unread_reason TEXT CHECK (unread_reason IN ('new', 'manual', 'updated') OR unread_reason IS NULL),
+      focus_override INTEGER NOT NULL DEFAULT 0 CHECK (focus_override IN (0, 1)),
       read_at TEXT,
       in_inbox INTEGER NOT NULL DEFAULT 1 CHECK (in_inbox IN (0, 1)),
       inbox_activity_at TEXT NOT NULL,
@@ -248,6 +305,18 @@ function migrate(db) {
   const userPaperStateColumns = new Set(db.prepare('PRAGMA table_info(user_paper_states)').all().map((column) => column.name));
   if (!userPaperStateColumns.has('note')) db.exec('ALTER TABLE user_paper_states ADD COLUMN note TEXT');
   if (!userPaperStateColumns.has('note_updated_at')) db.exec('ALTER TABLE user_paper_states ADD COLUMN note_updated_at TEXT');
+  if (!userPaperStateColumns.has('focus_override')) {
+    db.exec('ALTER TABLE user_paper_states ADD COLUMN focus_override INTEGER NOT NULL DEFAULT 0 CHECK (focus_override IN (0, 1))');
+    db.exec(`
+      UPDATE user_paper_states SET focus_override = 1
+      WHERE (unread_reason = 'manual' AND in_inbox = 1)
+        OR (unread_reason = 'updated' AND EXISTS (
+          SELECT 1 FROM paper_collections pc WHERE pc.paper_id = user_paper_states.paper_id
+        ))
+    `);
+  }
+
+  rebuildPaperSearchIndex(db);
 
   const now = new Date().toISOString();
   db.prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
@@ -269,6 +338,7 @@ function migrate(db) {
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('classification_margin', '0.03');
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('focus_threshold', '0.60');
   db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('archive_color', '#64748b');
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run('search_dense_weight', '0.60');
   db.prepare("INSERT OR IGNORE INTO collections (name, color, created_at) VALUES (?, '#f59e0b', ?)").run('Favorites', now);
   db.exec("DELETE FROM paper_classifications WHERE target_type = 'archive'");
   db.prepare(`
@@ -349,13 +419,22 @@ function focusThreshold(db) {
   return Number.isFinite(value) && value >= -1 && value <= 1 ? value : 0.6;
 }
 
+const FOCUS_LOCATION_CONDITION = `(
+  (ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections focus_pc WHERE focus_pc.paper_id = p.id))
+  OR (ups.focus_override = 1 AND EXISTS (SELECT 1 FROM paper_collections focus_pc WHERE focus_pc.paper_id = p.id))
+)`;
+const FOCUS_RELEVANCE_CONDITION = '(ups.focus_override = 1 OR pcl.score >= ?)';
+
 export function listInboxCategoryGroups(db, { view = 'inbox' } = {}) {
   const groupExpression = categoryGroupExpression('inbox_category.code', 'cc.group_code');
   const focusJoin = view === 'focus'
     ? 'LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version'
     : '';
+  const locationFilter = view === 'focus'
+    ? FOCUS_LOCATION_CONDITION
+    : 'NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)';
   const focusFilter = view === 'focus'
-    ? "AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?)"
+    ? `AND ${FOCUS_RELEVANCE_CONDITION}`
     : '';
   const parameters = view === 'focus' ? [focusThreshold(db)] : [];
   const rows = db.prepare(`
@@ -365,7 +444,7 @@ export function listInboxCategoryGroups(db, { view = 'inbox' } = {}) {
       JOIN user_paper_states ups ON ups.paper_id = p.id AND ups.in_inbox = 1
       ${focusJoin}
       JOIN json_each(p.categories_json) paper_category
-      WHERE NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)
+      WHERE ${locationFilter}
         ${focusFilter}
     )
     SELECT inbox_category.code, COALESCE(cc.name, inbox_category.code) AS name,
@@ -401,7 +480,7 @@ function filterList(value) {
   return [...new Set(values.flatMap((item) => String(item).split(',')).map((item) => item.trim()).filter(Boolean))];
 }
 
-export function listPapers(db, filters = {}) {
+function paperFilterParts(db, filters = {}, { includeTextQuery = true } = {}) {
   const view = filters.view ?? 'inbox';
   const conditions = [];
   const values = [];
@@ -414,14 +493,16 @@ export function listPapers(db, filters = {}) {
   } else if (view === 'archive') {
     conditions.push('ups.in_inbox = 0 AND ups.archived_at IS NOT NULL');
   } else {
-    conditions.push('ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections inbox_pc WHERE inbox_pc.paper_id = p.id)');
     if (view === 'focus') {
-      conditions.push("(ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?)");
+      conditions.push(FOCUS_LOCATION_CONDITION);
+      conditions.push(FOCUS_RELEVANCE_CONDITION);
       values.push(focusThreshold(db));
+    } else {
+      conditions.push('ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections inbox_pc WHERE inbox_pc.paper_id = p.id)');
     }
   }
 
-  if (filters.q) {
+  if (includeTextQuery && filters.q) {
     const query = `%${filters.q.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
     conditions.push(`(p.title LIKE ? ESCAPE '\\' OR p.authors LIKE ? ESCAPE '\\' OR p.abstract LIKE ? ESCAPE '\\' OR p.id LIKE ? ESCAPE '\\' OR p.categories_json LIKE ? ESCAPE '\\' OR ups.note LIKE ? ESCAPE '\\')`);
     values.push(query, query, query, query, query, query);
@@ -461,6 +542,18 @@ export function listPapers(db, filters = {}) {
     values.push(filters.since);
   }
 
+  const paperIds = filterList(filters.paperIds);
+  if (paperIds.length) {
+    conditions.push(`p.id IN (${placeholders(paperIds)})`);
+    values.push(...paperIds);
+  }
+
+  return { collectionJoin, conditions, values, timeColumn, view };
+}
+
+export function listPapers(db, filters = {}) {
+  const { collectionJoin, conditions, values, timeColumn, view } = paperFilterParts(db, filters);
+
   const sortColumn = filters.sort === 'updated' || (!filters.sort && ['focus', 'inbox'].includes(view))
     ? 'COALESCE(p.updated_at, p.announced_at, ups.inbox_activity_at)'
     : timeColumn;
@@ -468,7 +561,7 @@ export function listPapers(db, filters = {}) {
   const offset = Math.max(Number(filters.offset) || 0, 0);
 
   const rows = db.prepare(`
-    SELECT p.*, ups.is_read, ups.unread_reason, ups.in_inbox, ups.inbox_activity_at,
+    SELECT p.*, ups.is_read, ups.unread_reason, ups.focus_override, ups.in_inbox, ups.inbox_activity_at,
       ups.archived_version, ups.archived_at, ups.note, ups.note_updated_at,
       paa.status AS ai_status, paa.explanation_zh, paa.translation_zh IS NOT NULL AS has_translation_zh,
       pcl.target_type AS predicted_target_type, pcl.target_collection_id AS predicted_collection_id,
@@ -498,6 +591,38 @@ export function listPapers(db, filters = {}) {
   }));
 }
 
+export function searchPaperText(db, ftsQuery, filters = {}, limit = 200) {
+  const { collectionJoin, conditions, values } = paperFilterParts(db, filters, { includeTextQuery: false });
+  const candidateLimit = Math.min(Math.max(Number(limit) || 200, 1), 500);
+  return db.prepare(`
+    SELECT paper_search_fts.paper_id,
+      bm25(paper_search_fts, 4.0, 5.0, 2.0, 1.0, 2.0, 1.5) AS score
+    FROM paper_search_fts
+    JOIN papers p ON p.id = paper_search_fts.paper_id
+    JOIN user_paper_states ups ON ups.paper_id = p.id
+    ${collectionJoin}
+    LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version
+    WHERE paper_search_fts MATCH ? AND ${conditions.join(' AND ')}
+    ORDER BY score, p.id
+    LIMIT ?
+  `).all(ftsQuery, ...values, candidateLimit);
+}
+
+export function listDenseSearchCandidates(db, filters = {}) {
+  const { collectionJoin, conditions, values } = paperFilterParts(db, filters, { includeTextQuery: false });
+  return db.prepare(`
+    SELECT p.id, pe.vector, pe.dimensions, pe.model
+    FROM papers p
+    JOIN user_paper_states ups ON ups.paper_id = p.id
+    ${collectionJoin}
+    LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version
+    JOIN paper_embeddings pe ON pe.paper_id = p.id AND pe.paper_version = p.latest_version
+    WHERE pe.status = 'succeeded' AND pe.vector IS NOT NULL
+      AND ${conditions.join(' AND ')}
+    ORDER BY p.id
+  `).all(...values);
+}
+
 export function getStats(db) {
   const threshold = focusThreshold(db);
   const active = db.prepare(`
@@ -506,15 +631,12 @@ export function getStats(db) {
       COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS inbox,
       COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.is_read = 0 AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS unread,
       COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.unread_reason = 'updated' AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id) THEN 1 ELSE 0 END), 0) AS updated,
-      COALESCE(SUM(CASE WHEN ups.in_inbox = 1
-        AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id)
-        AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?) THEN 1 ELSE 0 END), 0) AS focus,
-      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.is_read = 0
-        AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id)
-        AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?) THEN 1 ELSE 0 END), 0) AS focus_unread,
-      COALESCE(SUM(CASE WHEN ups.in_inbox = 1 AND ups.unread_reason = 'updated'
-        AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = ups.paper_id)
-        AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?) THEN 1 ELSE 0 END), 0) AS focus_updated
+      COALESCE(SUM(CASE WHEN ${FOCUS_LOCATION_CONDITION}
+        AND ${FOCUS_RELEVANCE_CONDITION} THEN 1 ELSE 0 END), 0) AS focus,
+      COALESCE(SUM(CASE WHEN ups.is_read = 0 AND ${FOCUS_LOCATION_CONDITION}
+        AND ${FOCUS_RELEVANCE_CONDITION} THEN 1 ELSE 0 END), 0) AS focus_unread,
+      COALESCE(SUM(CASE WHEN ups.unread_reason = 'updated' AND ${FOCUS_LOCATION_CONDITION}
+        AND ${FOCUS_RELEVANCE_CONDITION} THEN 1 ELSE 0 END), 0) AS focus_updated
     FROM user_paper_states ups
     JOIN papers p ON p.id = ups.paper_id
     LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version
@@ -628,9 +750,9 @@ export function enqueueUnprocessedFocusAnalyses(db) {
     JOIN user_paper_states ups ON ups.paper_id = p.id
     LEFT JOIN paper_classifications pcl ON pcl.paper_id = p.id AND pcl.paper_version = p.latest_version
     LEFT JOIN paper_ai_analyses paa ON paa.paper_id = p.id AND paa.paper_version = p.latest_version
-    WHERE ups.in_inbox = 1 AND paa.paper_id IS NULL
-      AND NOT EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = p.id)
-      AND (ups.unread_reason IN ('updated', 'manual') OR pcl.score >= ?)
+    WHERE paa.paper_id IS NULL
+      AND ${FOCUS_LOCATION_CONDITION}
+      AND ${FOCUS_RELEVANCE_CONDITION}
     ORDER BY ups.inbox_activity_at DESC, p.id
   `).all(focusThreshold(db)).map((row) => row.id);
   return enqueuePaperAnalyses(db, ids, 'auto');
@@ -676,7 +798,7 @@ export function exportBackup(db) {
 
 export function restoreBackup(db, payload, options = {}) {
   const compatibleFormats = new Set(['arxiv-follow-up-backup', 'localrss-backup']);
-  if (!payload || !compatibleFormats.has(payload.format) || ![1, 2, 3, 4, 5, SCHEMA_VERSION].includes(payload.schemaVersion) || !payload.tables) {
+  if (!payload || !compatibleFormats.has(payload.format) || ![1, 2, 3, 4, 5, 6, 7, SCHEMA_VERSION].includes(payload.schemaVersion) || !payload.tables) {
     throw new Error('This is not a compatible ArxivFollowUp backup.');
   }
 
@@ -701,6 +823,17 @@ export function restoreBackup(db, payload, options = {}) {
     }
   });
   migrate(db);
+  if (payload.schemaVersion < 7) {
+    db.exec(`
+      UPDATE user_paper_states SET focus_override = CASE
+        WHEN unread_reason = 'manual' AND in_inbox = 1 THEN 1
+        WHEN unread_reason = 'updated' AND EXISTS (
+          SELECT 1 FROM paper_collections pc WHERE pc.paper_id = user_paper_states.paper_id
+        ) THEN 1
+        ELSE 0
+      END
+    `);
+  }
   return safetyPath;
 }
 

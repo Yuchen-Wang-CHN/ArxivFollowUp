@@ -35,6 +35,7 @@ import {
 import { fetchCategoryTaxonomy, getFallbackCategories } from './arxiv.js';
 import { DOMPURIFY_FILE, HOST, KATEX_DIRECTORY, MARKED_FILE, PORT, PUBLIC_DIRECTORY } from './config.js';
 import { dueSubscriptions, enrichPaperDates, syncSubscriptions } from './sync.js';
+import { searchPapers } from './search.js';
 
 const MIME_TYPES = {
   '.css': 'text/css; charset=utf-8',
@@ -167,14 +168,14 @@ function changePaperState(db, paperId, action, options = {}) {
   if (!paper) throw Object.assign(new Error('Paper not found.'), { statusCode: 404 });
 
   if (action === 'read') {
-    db.prepare("UPDATE user_paper_states SET is_read = 1, unread_reason = NULL, read_at = ? WHERE paper_id = ?").run(now, paperId);
+    db.prepare("UPDATE user_paper_states SET is_read = 1, unread_reason = NULL, focus_override = 0, read_at = ? WHERE paper_id = ?").run(now, paperId);
   } else if (action === 'unread') {
-    db.prepare("UPDATE user_paper_states SET is_read = 0, unread_reason = 'manual', read_at = NULL WHERE paper_id = ?").run(paperId);
+    db.prepare("UPDATE user_paper_states SET is_read = 0, unread_reason = 'manual', focus_override = 1, read_at = NULL WHERE paper_id = ?").run(paperId);
   } else if (action === 'archive') {
     const collectionCount = Number(db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count);
     db.prepare('DELETE FROM paper_collections WHERE paper_id = ?').run(paperId);
     db.prepare(`
-      UPDATE user_paper_states SET in_inbox = 0, archived_version = ?, archived_at = ?
+      UPDATE user_paper_states SET in_inbox = 0, focus_override = 0, archived_version = ?, archived_at = ?
       WHERE paper_id = ?
     `).run(paper.latest_version, now, paperId);
     return { classificationChanged: collectionCount > 0 };
@@ -195,7 +196,7 @@ function changePaperState(db, paperId, action, options = {}) {
     const collectionCount = db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count;
     if (collectionCount) throw Object.assign(new Error('Remove the paper from all collections before moving it to Inbox.'), { statusCode: 409 });
     db.prepare(`
-      UPDATE user_paper_states SET in_inbox = 1, is_read = 0, unread_reason = 'manual', read_at = NULL,
+      UPDATE user_paper_states SET in_inbox = 1, is_read = 0, unread_reason = 'manual', focus_override = 1, read_at = NULL,
         inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
       WHERE paper_id = ?
     `).run(now, paperId);
@@ -208,7 +209,7 @@ function changePaperState(db, paperId, action, options = {}) {
       INSERT OR IGNORE INTO paper_collections (paper_id, collection_id, added_at) VALUES (?, ?, ?)
     `).run(paperId, collectionId, now);
     db.prepare(`
-      UPDATE user_paper_states SET in_inbox = 0, archived_version = NULL, archived_at = NULL WHERE paper_id = ?
+      UPDATE user_paper_states SET in_inbox = 0, focus_override = 0, archived_version = NULL, archived_at = NULL WHERE paper_id = ?
     `).run(paperId);
     return { classificationChanged: true };
   } else if (action === 'removeFromCollection') {
@@ -219,7 +220,7 @@ function changePaperState(db, paperId, action, options = {}) {
     const remainingCount = db.prepare('SELECT COUNT(*) AS count FROM paper_collections WHERE paper_id = ?').get(paperId).count;
     if (remainingCount === 0) {
       db.prepare(`
-        UPDATE user_paper_states SET in_inbox = 1, is_read = 0, unread_reason = 'manual', read_at = NULL,
+        UPDATE user_paper_states SET in_inbox = 1, is_read = 0, unread_reason = 'manual', focus_override = 1, read_at = NULL,
           inbox_activity_at = ?, archived_version = NULL, archived_at = NULL
         WHERE paper_id = ?
       `).run(now, paperId);
@@ -362,6 +363,30 @@ export function createApp({
         return json(response, 200, {
           papers: listPapers(db, filters),
           paperCategoryGroups: listInboxCategoryGroups(db, { view: filters.view === 'focus' ? 'focus' : 'inbox' }),
+          stats: getStats(db),
+          latestSyncRunId: getLatestCompletedSyncRunId(db),
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/search') {
+        const payload = await readJson(request, 100 * 1024);
+        const filters = payload.filters && typeof payload.filters === 'object' ? { ...payload.filters } : {};
+        const view = payload.view === 'collections' ? 'collection' : (payload.view ?? filters.view ?? 'inbox');
+        if (!['focus', 'inbox', 'archive', 'collection'].includes(view)) {
+          throw Object.assign(new Error('Invalid search view.'), { statusCode: 400 });
+        }
+        filters.view = view;
+        if (payload.collectionId != null) filters.collectionId = payload.collectionId;
+        const result = await searchPapers(db, {
+          query: payload.query,
+          offset: payload.offset,
+          limit: payload.limit,
+          filters,
+          fetchImpl: embeddingOptions.fetchImpl,
+        });
+        return json(response, 200, {
+          ...result,
+          paperCategoryGroups: listInboxCategoryGroups(db, { view: view === 'focus' ? 'focus' : 'inbox' }),
           stats: getStats(db),
           latestSyncRunId: getLatestCompletedSyncRunId(db),
         });
@@ -715,6 +740,13 @@ export function createApp({
             enqueueUnprocessedFocusAnalyses(db);
             ai.kick();
           }
+        }
+        if (payload.searchDenseWeight != null) {
+          const value = Number(payload.searchDenseWeight);
+          if (!Number.isFinite(value) || value < 0 || value > 1) {
+            throw Object.assign(new Error('Dense search weight must be between 0 and 1.'), { statusCode: 400 });
+          }
+          setSetting(db, 'search_dense_weight', value.toFixed(2));
         }
         return json(response, 200, { settings: getSettings(db), stats: getStats(db) });
       }

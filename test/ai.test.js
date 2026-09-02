@@ -96,7 +96,7 @@ test('Focus reconciliation queues only relevant predictions and explicit follow-
       threshold, model, profile_hash, classified_at
     ) VALUES ('2608.00001', 1, 'collection', ?, 0.72, NULL, 0.55, 'test-model', 'profile', ?)
   `).run(favorites.id, now);
-  db.prepare("UPDATE user_paper_states SET unread_reason = 'manual' WHERE paper_id = '2608.00002'").run();
+  db.prepare("UPDATE user_paper_states SET unread_reason = 'manual', focus_override = 1 WHERE paper_id = '2608.00002'").run();
 
   const result = enqueueUnprocessedFocusAnalyses(db);
   assert.equal(result.queued, 2);

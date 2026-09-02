@@ -132,6 +132,14 @@ Focus Inbox 默认最低相关度为 `0.60`，分类门槛默认为 `0.55`；Foc
 
 Archive 中的论文不会参与分类。预测标签仅用于辅助浏览，不会自动移动或归档论文。
 
+## 混合自然语言搜索
+
+论文列表顶部的搜索框使用 SQLite FTS5 BM25 与 Dense Embedding 进行混合检索。BM25 覆盖标题、作者、摘要、分类、arXiv ID 和本地笔记；Dense 检索只发送查询文本，并与现有的标题加摘要向量比较，本地笔记不会发送给 Embedding 服务。
+
+在 **Settings → Hybrid search** 中可以调整 Dense 权重，BM25 权重会自动取剩余比例。两路结果使用加权 Reciprocal Rank Fusion 合并。Embedding 关闭、Dense 权重设为零或服务临时不可用时，搜索会自动使用 100% BM25，并在结果上方显示当前实际搜索模式。
+
+搜索由 Enter 或 **Search** 按钮提交，以避免输入过程中反复调用 Embedding API；清空搜索框会恢复普通论文列表。
+
 Embedding 服务也可以通过环境变量提供默认值：
 
 | 环境变量 | 默认值 | 用途 |

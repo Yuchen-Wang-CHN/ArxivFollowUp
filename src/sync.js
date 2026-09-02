@@ -35,7 +35,7 @@ export function ingestFeed(db, subscription, feed, now = new Date().toISOString(
           INSERT INTO user_paper_states (
             paper_id, is_read, unread_reason, in_inbox, inbox_activity_at
           ) VALUES (?, 0, ?, 1, ?)
-        `).run(item.id, restoredFromArchive ? 'updated' : 'new', now);
+        `).run(item.id, 'new', now);
         if (restoredFromArchive) updated.add(item.id);
         else added.add(item.id);
       } else if (item.version > existing.latest_version) {
@@ -47,10 +47,14 @@ export function ingestFeed(db, subscription, feed, now = new Date().toISOString(
         `).run(item.version, item.title, item.authors, item.abstract, mergedCategories,
           item.announcedAt, now, item.arxivUrl, item.pdfUrl, item.id);
         const state = db.prepare('SELECT * FROM user_paper_states WHERE paper_id = ?').get(item.id);
+        const wasCollected = Boolean(db.prepare('SELECT 1 FROM paper_collections WHERE paper_id = ? LIMIT 1').get(item.id));
+        const wasProcessed = Boolean(state?.is_read || wasCollected);
+        const shouldFocus = Boolean(wasProcessed || state?.focus_override);
         db.prepare(`
           UPDATE user_paper_states SET
             is_read = 0,
-            unread_reason = CASE WHEN archived_at IS NOT NULL OR is_read = 1 THEN 'updated' ELSE unread_reason END,
+            unread_reason = CASE WHEN ? = 1 THEN 'updated' ELSE unread_reason END,
+            focus_override = ?,
             read_at = NULL,
             in_inbox = CASE
               WHEN EXISTS (SELECT 1 FROM paper_collections pc WHERE pc.paper_id = user_paper_states.paper_id) THEN 0
@@ -60,7 +64,7 @@ export function ingestFeed(db, subscription, feed, now = new Date().toISOString(
             archived_version = NULL,
             archived_at = NULL
           WHERE paper_id = ?
-        `).run(now, item.id);
+        `).run(wasProcessed ? 1 : 0, shouldFocus ? 1 : 0, now, item.id);
         if (state) updated.add(item.id);
       } else {
         const mergedCategories = mergeCategories(existing.categories_json, itemCategories);

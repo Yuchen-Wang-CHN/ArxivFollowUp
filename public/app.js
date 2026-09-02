@@ -14,6 +14,8 @@ const state = {
   paperLoadRequest: 0,
   latestSyncRunId: 0,
   noteSaves: new Map(),
+  searchQuery: '',
+  searchMeta: null,
 };
 
 const PAPER_PAGE_SIZE = 100;
@@ -35,6 +37,8 @@ const elements = {
   nextPage: document.querySelector('#next-page'),
   pageLabel: document.querySelector('#page-label'),
   search: document.querySelector('#search-input'),
+  searchForm: document.querySelector('#search-form'),
+  searchModeStatus: document.querySelector('#search-mode-status'),
   categoryFilter: document.querySelector('#category-filter'),
   categoryFilterLabel: document.querySelector('#category-filter-label'),
   categoryFilterMenu: document.querySelector('#category-filter-menu'),
@@ -459,7 +463,7 @@ function paperCard(paper) {
 
 function renderPapers() {
   const filtersActive = Boolean(
-    elements.search.value.trim()
+    state.searchQuery
     || state.selectedCategoryGroups.size
     || state.selectedCategories.size
     || elements.readFilter.value
@@ -483,8 +487,10 @@ function renderPapers() {
   elements.nextPage.disabled = !state.hasMorePapers;
   elements.pageLabel.textContent = `Page ${state.paperPage + 1}`;
   if (!state.papers.length) {
-    const copy = state.view === 'focus'
-      ? ['Focus Inbox is clear', '高相关论文、版本更新和你主动标记为未读的论文会出现在这里。完整抓取结果仍保留在 All Papers。']
+    const copy = state.searchQuery
+      ? ['No matching papers', '尝试使用更宽泛的描述、论文原文语言，或调整分类与时间过滤条件。']
+      : state.view === 'focus'
+        ? ['Focus Inbox is clear', '高相关论文、版本更新和你主动标记为未读的论文会出现在这里。完整抓取结果仍保留在 All Papers。']
       : state.view === 'inbox'
         ? ['All Papers is clear', '同步发现的全部候选论文会保留在这里。']
       : state.view === 'archive'
@@ -499,6 +505,24 @@ function renderPapers() {
   updateSelectionUi();
   ensureAiPolling();
   ensureEmbeddingPolling();
+}
+
+function updateSearchStatus(search = state.searchMeta) {
+  if (!elements.searchModeStatus) return;
+  elements.searchModeStatus.classList.toggle('hidden', !state.searchQuery);
+  elements.searchModeStatus.classList.toggle('degraded', Boolean(search?.degraded));
+  if (!state.searchQuery) {
+    elements.searchModeStatus.textContent = '';
+    return;
+  }
+  if (!search) {
+    elements.searchModeStatus.textContent = 'Searching…';
+    return;
+  }
+  const dense = Math.round(Number(search.effectiveDenseWeight ?? 0) * 100);
+  const bm25 = 100 - dense;
+  const mode = search.mode === 'hybrid' ? 'Hybrid search' : 'BM25 search';
+  elements.searchModeStatus.textContent = `${mode} · BM25 ${bm25}% · Dense ${dense}%${search.degraded && search.message ? ` · ${search.message}` : ''}`;
 }
 
 function updateAiStatusText(status = state.bootstrap?.ai) {
@@ -607,7 +631,6 @@ function currentPaperFilters({ offset = 0, limit = PAPER_PAGE_SIZE + 1 } = {}) {
   params.set('offset', String(offset));
   params.set('limit', String(limit));
   if (state.view === 'collections') params.set('collectionId', state.collectionId);
-  if (elements.search.value.trim()) params.set('q', elements.search.value.trim());
   for (const category of state.selectedCategories) params.append('category', category);
   for (const group of state.selectedCategoryGroups) params.append('categoryGroup', group);
   if (elements.readFilter.value) params.set('read', elements.readFilter.value);
@@ -631,9 +654,29 @@ async function loadPapers({ resetPage = false } = {}) {
   }
   const requestId = ++state.paperLoadRequest;
   elements.paperList.classList.add('loading');
+  if (state.searchQuery) { state.searchMeta = null; updateSearchStatus(); }
   try {
     const offset = state.paperPage * PAPER_PAGE_SIZE;
-    const payload = await api(`/api/papers?${currentPaperFilters({ offset })}`);
+    const params = currentPaperFilters({ offset });
+    const payload = state.searchQuery
+      ? await api('/api/search', {
+        method: 'POST',
+        body: {
+          query: state.searchQuery,
+          view: state.view,
+          collectionId: state.collectionId,
+          offset,
+          limit: PAPER_PAGE_SIZE + 1,
+          filters: {
+            categories: [...state.selectedCategories],
+            categoryGroups: [...state.selectedCategoryGroups],
+            read: elements.readFilter.value,
+            updated: elements.updatedFilter.value,
+            since: params.get('since'),
+          },
+        },
+      })
+      : await api(`/api/papers?${params}`);
     if (requestId !== state.paperLoadRequest) return;
     const previousCategoryFilters = categoryFilterSignature();
     state.bootstrap.paperCategoryGroups = payload.paperCategoryGroups;
@@ -648,6 +691,8 @@ async function loadPapers({ resetPage = false } = {}) {
       return loadPapers();
     }
     state.papers = page;
+    state.searchMeta = payload.search ?? null;
+    updateSearchStatus();
     state.selected.clear();
     updateStats(payload.stats);
     renderPapers();
@@ -850,14 +895,6 @@ async function restoreFromFile(file) {
   } catch (error) { toast(error.message, 'error'); }
 }
 
-function debounce(callback, wait) {
-  let timer;
-  return (...args) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => callback(...args), wait);
-  };
-}
-
 function setNoteStatus(paperId, text, error = false) {
   const card = [...elements.paperList.querySelectorAll('.paper-card')]
     .find((item) => item.dataset.paperId === paperId);
@@ -925,7 +962,19 @@ elements.nextPage.addEventListener('click', async () => {
 });
 document.querySelector('#add-subscription-form').addEventListener('submit', addSubscription);
 
-elements.search.addEventListener('input', debounce(() => loadPapers({ resetPage: true }), 250));
+elements.searchForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  state.searchQuery = elements.search.value.trim();
+  state.searchMeta = null;
+  loadPapers({ resetPage: true });
+});
+elements.search.addEventListener('input', () => {
+  if (elements.search.value.trim() || !state.searchQuery) return;
+  state.searchQuery = '';
+  state.searchMeta = null;
+  updateSearchStatus();
+  loadPapers({ resetPage: true });
+});
 elements.categoryFilterMenu.addEventListener('change', (event) => {
   const groupCode = event.target.dataset.categoryGroup;
   const categoryCode = event.target.dataset.categoryCode;
@@ -1135,6 +1184,28 @@ document.querySelector('#open-browser-on-start').addEventListener('change', asyn
     toast('Startup browser preference saved');
   } catch (error) { toast(error.message, 'error'); }
 });
+function updateSearchWeightHint() {
+  const dense = Number(document.querySelector('#search-dense-weight').value);
+  document.querySelector('#search-dense-weight-value').textContent = `${dense}%`;
+  document.querySelector('#search-weight-hint').textContent = `BM25 ${100 - dense}% · Dense ${dense}%`;
+}
+document.querySelector('#search-dense-weight').addEventListener('input', updateSearchWeightHint);
+document.querySelector('#search-settings-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.submitter;
+  if (button) button.disabled = true;
+  try {
+    const payload = await api('/api/settings', {
+      method: 'PATCH',
+      body: { searchDenseWeight: Number(document.querySelector('#search-dense-weight').value) / 100 },
+    });
+    state.bootstrap.settings = payload.settings;
+    updateSearchWeightHint();
+    if (state.searchQuery) await loadPapers({ resetPage: true });
+    toast('Search settings saved');
+  } catch (error) { toast(error.message, 'error'); }
+  finally { if (button) button.disabled = false; }
+});
 elements.focusThreshold.addEventListener('change', async (event) => {
   try {
     const payload = await api('/api/settings', { method: 'PATCH', body: { focusThreshold: Number(event.target.value) } });
@@ -1299,6 +1370,8 @@ async function boot() {
     document.querySelector('#refresh-days').value = state.bootstrap.settings.refresh_interval_days;
     document.querySelector('#display-density').value = state.bootstrap.settings.display_density;
     document.querySelector('#open-browser-on-start').checked = state.bootstrap.settings.open_browser_on_start !== '0';
+    document.querySelector('#search-dense-weight').value = Math.round(Number(state.bootstrap.settings.search_dense_weight ?? 0.6) * 100);
+    updateSearchWeightHint();
     elements.focusThreshold.value = state.bootstrap.settings.focus_threshold ?? '0.60';
     updateFocusThresholdConstraint();
     updateFocusThresholdHint();

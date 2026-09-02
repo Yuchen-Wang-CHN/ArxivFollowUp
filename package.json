@@ -18,7 +18,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "test": "node --test \"test/*.test.js\"",
-    "check": "node --check public/app.js && node --check src/server.js && node --check src/embeddings.js && npm test"
+    "check": "node --check public/app.js && node --check src/server.js && node --check src/embeddings.js && node --check src/search.js && npm test"
   },
   "dependencies": {
     "dompurify": "3.4.14",
