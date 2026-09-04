@@ -95,7 +95,7 @@ npm start
 例如，可以使用 Qwen3.8 27B 等支持 OpenAI-compatible API 的模型。
 
 - **关闭**：不创建新任务，但继续显示已有结果
-- **自动**：Embedding 分类完成后，只自动分析进入 Focus 的新论文和新版本
+- **自动**：Embedding 分类完成后，只自动分析进入 Focus 的新论文和新版本；也可以在 All Papers 中按需点击单篇论文的“AI 翻译总结”
 - **手动**：只分析在 Focus 或 All Papers 中勾选并提交的论文
 
 也可以在启动前通过环境变量提供默认配置：

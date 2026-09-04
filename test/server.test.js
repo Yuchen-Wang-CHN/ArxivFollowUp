@@ -353,6 +353,34 @@ test('AI configuration and manual batch endpoints validate mode and queue select
   assert.equal((await queued.json()).queued, 1);
 });
 
+test('automatic AI mode allows an individual All Papers paper to be queued on demand', async (context) => {
+  const db = createDatabase(':memory:');
+  const now = '2026-08-20T00:00:00.000Z';
+  const inserted = db.prepare("INSERT INTO subscriptions (category, created_at) VALUES ('cs.AI', ?)").run(now);
+  const subscription = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(Number(inserted.lastInsertRowid));
+  ingestFeed(db, subscription, { errors: [], papers: [{
+    id: '2608.00002', version: 1, title: 'All Papers AI paper', authors: 'Author', abstract: 'Abstract',
+    categories: ['cs.AI'], announcedAt: now, arxivUrl: 'https://arxiv.org/abs/2608.00002',
+    pdfUrl: 'https://arxiv.org/pdf/2608.00002', announceType: 'new',
+  }] }, now);
+  db.prepare("UPDATE settings SET value = 'auto' WHERE key = 'ai_processing_mode'").run();
+
+  const app = createApp({ db, port: 0 });
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  context.after(() => { app.server.close(); db.close(); });
+  const { port } = app.server.address();
+  const response = await fetch(`http://127.0.0.1:${port}/api/papers/2608.00002/ai/queue`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-AFU-Request': '1' }, body: '{}',
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 202);
+  assert.equal(payload.queued, 1);
+  assert.deepEqual({ ...db.prepare(`
+    SELECT trigger, priority FROM paper_ai_analyses WHERE paper_id = '2608.00002'
+  `).get() }, { trigger: 'manual', priority: 100 });
+});
+
 test('LLM and Embedding API keys are stored locally without being returned by bootstrap', async (context) => {
   const db = createDatabase(':memory:');
   const app = createApp({ db, port: 0 });

@@ -550,7 +550,15 @@ export function createApp({
         if (getAiConfiguration(db).mode === 'off') throw Object.assign(new Error('Enable Manual or Auto AI processing before retrying.'), { statusCode: 409 });
         const result = enqueuePaperAnalyses(db, [decodeURIComponent(paperAiRetryMatch[1])], 'manual', { force: true });
         ai.configurationChanged();
-        return json(response, 202, result);
+        return json(response, 202, { ...result, status: ai.status() });
+      }
+
+      const paperAiQueueMatch = url.pathname.match(/^\/api\/papers\/(.+)\/ai\/queue$/);
+      if (request.method === 'POST' && paperAiQueueMatch) {
+        if (getAiConfiguration(db).mode === 'off') throw Object.assign(new Error('Enable Manual or Auto AI processing before queuing a paper.'), { statusCode: 409 });
+        const result = enqueuePaperAnalyses(db, [decodeURIComponent(paperAiQueueMatch[1])], 'manual');
+        ai.kick();
+        return json(response, 202, { ...result, status: ai.status() });
       }
 
       const paperAiMatch = url.pathname.match(/^\/api\/papers\/(.+)\/ai$/);

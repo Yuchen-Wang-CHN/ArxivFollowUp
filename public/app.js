@@ -354,6 +354,13 @@ function translationPlaceholder(paper) {
   return '尚未生成中文摘要。';
 }
 
+function paperAiButton(paper) {
+  if (state.view !== 'inbox' || state.bootstrap?.ai?.mode === 'off') return '';
+  if (paper.ai_status === 'failed') return '<button class="icon-button" data-action="ai-retry" title="重试 AI 翻译总结">AI</button>';
+  if (!paper.ai_status) return '<button class="icon-button" data-action="ai-run" title="AI 翻译总结">AI</button>';
+  return '';
+}
+
 function paperClassification(paper) {
   if (state.view === 'archive') {
     return { name: 'Archive', color: safeColor(state.bootstrap.embeddings?.archiveColor), confirmed: true, score: null };
@@ -426,6 +433,7 @@ function paperCard(paper) {
         </div>
       </div>
       <div class="paper-actions">
+        ${paperAiButton(paper)}
         <button class="icon-button" data-action="${isUnread ? 'read' : 'unread'}" title="${isUnread ? 'Mark read' : 'Mark unread'}">${isUnread ? '○' : '●'}</button>
         ${quickCollectionMenu(paper)}
         <button class="icon-button" data-action="${action}" title="${actionLabel}">${state.view === 'archive' ? '↥' : '□'}</button>
@@ -439,7 +447,6 @@ function paperCard(paper) {
         ${state.view === 'collections' ? `<button class="text-button" data-action="removeFromCollection" data-collection-id="${Number(state.collectionId)}">Remove from this collection</button>` : ''}
         ${state.view === 'archive' ? '<button class="text-button danger" data-action="purgeArchive">删除本地内容</button>' : ''}
         <button class="text-button" data-action="versions">Version history</button>
-        ${paper.ai_status === 'failed' ? '<button class="text-button" data-action="ai-retry">Retry AI</button>' : ''}
         <section class="paper-note" aria-label="论文笔记">
           <div class="paper-note-heading">
             <strong>笔记</strong>
@@ -1079,12 +1086,15 @@ elements.paperList.addEventListener('click', async (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (action === 'purgeArchive' && !window.confirm('删除这篇归档论文的全部本地内容、AI 结果和 Embedding？删除后该条目会从 Archive 消失；相同版本不会被 RSS 再次加入。')) return;
-  if (action === 'ai-retry') {
+  if (action === 'ai-run' || action === 'ai-retry') {
     try {
-      await api(`/api/papers/${encodeURIComponent(paperId)}/ai/retry`, { method: 'POST', body: {} });
+      const endpoint = action === 'ai-retry' ? 'retry' : 'queue';
+      const payload = await api(`/api/papers/${encodeURIComponent(paperId)}/ai/${endpoint}`, { method: 'POST', body: {} });
       const paper = state.papers.find((item) => item.id === paperId);
       if (paper) { paper.ai_status = 'pending'; paper.explanation_zh = null; }
+      if (payload.status) state.bootstrap.ai = payload.status;
       renderPapers();
+      if (payload.status) updateAiStatusText(payload.status);
       toast('AI analysis queued');
     } catch (error) { toast(error.message, 'error'); }
     return;
