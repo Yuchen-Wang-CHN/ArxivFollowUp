@@ -23,7 +23,7 @@
   "dependencies": {
     "dompurify": "3.4.14",
     "fast-xml-parser": "^5.2.5",
-    "katex": "^0.18.4",
+    "katex": "^0.18.5",
     "marked": "18.0.11"
   }
 }
