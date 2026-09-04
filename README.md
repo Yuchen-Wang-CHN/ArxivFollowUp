@@ -1,66 +1,16 @@
 # ArxivFollowUp (AFU)
 
-完整保存 arXiv 新论文和版本更新，再把与你兴趣最相关的内容送进一个本地 Focus Inbox。
+把 arXiv 新论文和版本更新收进本地，再从中挑出真正值得你关注的内容。
 
-ArxivFollowUp 是一款本地运行的 arXiv 论文追踪工具。订阅 `cs.AI`、`cs.LG` 等 Category 后，完整抓取结果会保留在 All Papers，Embedding 会把高相关论文送进 Focus Inbox；已经处理过的论文如果出现更高版本，也会重新进入 Focus，避免重要更新悄悄溜走。
+订阅 `cs.AI`、`cs.LG` 等 Category 后，AFU 会把同步到的论文完整保留在 **All Papers**，并根据你的 Collection 将高相关论文送进 **Focus Inbox**。读过或归档的论文如果发布了新版本，也会重新出现，不让重要更新悄悄溜走。
 
-连接任意 OpenAI-compatible API 后，AFU 还能为论文生成一句话中文解读和摘要翻译。订阅、论文元数据、阅读状态、收藏夹和 AI 结果均保存在本地 SQLite 中，不需要账户或云端数据库。
+连接任意 OpenAI-compatible API，还可以直接生成一句话中文解读和摘要翻译，先快速判断是否值得细读。AI 完全可选，关闭后不影响订阅、同步、搜索和阅读管理。
 
-![ArxivFollowUp Inbox 界面](./docs/images/arxiv-follow-up-inbox.png)
+![ArxivFollowUp Focus Inbox 界面](./docs/images/arxiv-follow-up-inbox.png)
 
-## 核心功能
+## 三步开始
 
-### 持续追踪论文及版本
-
-- 按 arXiv Category 订阅研究方向
-- 增量发现新论文和更高版本，并按 arXiv ID 自动去重
-- 保存本地实际观察到的版本历史
-- 已归档论文出现新版本时重新进入 Focus Inbox
-
-### 用 AI 快速判断是否值得读
-
-- 在论文列表中直接显示一句话中文解读
-- 支持原文、中文翻译和左右双栏摘要
-- 可自动处理新论文，也可只分析手动选中的论文
-- 支持自定义 OpenAI-compatible API、模型和并发数
-
-### 用 Embedding 构建 Focus Inbox
-
-- LLM 分析与 Embedding 可分别配置 API、模型和密钥
-- 根据 Collection 中的论文学习你的兴趣分类
-- 通过可调相关度门槛，把高相关论文送进 Focus Inbox
-- 在论文卡片中显示预测类别，帮助你理解入选原因
-- 可为 Collection 和 Archive 设置颜色；预测标签不会改变论文所在位置
-
-AI 完全可选。关闭后，订阅、同步和阅读管理仍可正常使用。
-
-### 把论文当作待处理队列
-
-- 使用 Read / Unread 标记阅读状态
-- 通过 Archive 表示不感兴趣，同时保留论文与 AI 内容供以后查看
-- 可从 Archive 中删除不再需要的本地内容
-- 使用多个 Collection 保存值得继续关注的论文
-- 为每篇论文编写 Markdown 笔记，实时预览并自动保存
-- 支持搜索论文元数据和笔记、Category 与状态筛选、批量处理，以及每页 100 篇的分页
-
-### 数据留在本地
-
-- 使用本地 SQLite 保存数据，无需登录
-- 服务默认只监听 `127.0.0.1`
-- 支持完整 JSON 备份与恢复
-- 支持 Windows 托盘后台运行和 macOS 一键启动
-
-## 使用方式
-
-1. 在 **Subscriptions** 中添加想追踪的 arXiv Category。
-2. AFU 同步当前 RSS，将完整结果保留在 **All Papers**，并把高相关论文送入 **Focus Inbox**。
-3. 优先浏览 Focus 中的标题和 AI 一句话解读，必要时到 All Papers 搜索完整结果。
-4. 将论文标为已读、加入 Collection，或在处理完成后 Archive。
-5. 后续同步发现更高版本时，论文会再次出现在 Focus Inbox 并标记为 Updated。
-
-## 快速开始
-
-需要 Node.js 24 或更高版本；SQLite 已由 Node.js 内置。
+需要 Node.js 24 或更高版本。SQLite 已由 Node.js 内置，不需要另外安装数据库。
 
 ```bash
 git clone https://github.com/Yuchen-Wang-CHN/ArxivFollowUp.git
@@ -69,36 +19,67 @@ npm ci
 npm start
 ```
 
-打开 <http://127.0.0.1:43110>。
+然后打开 <http://127.0.0.1:43110>，进入 **Subscriptions** 添加你想追踪的 arXiv Category。
 
 ### Windows
 
-完成一次 `npm ci` 后，可以双击 `start-afu.cmd`。AFU 会在后台启动、打开默认浏览器，并常驻系统托盘。双击托盘图标可再次打开页面，通过托盘菜单中的 **Exit ArxivFollowUp** 可停止服务。
+完成一次 `npm ci` 后，可以直接双击 `start-afu.cmd`。AFU 会在后台启动、打开默认浏览器，并常驻系统托盘；通过托盘菜单中的 **Exit ArxivFollowUp** 可以停止服务。
 
 ### macOS
 
-完成一次 `npm ci` 后，可以在 Finder 中双击 `start-afu.command`。再次双击只会打开已经运行的 AFU，不会重复启动服务。双击 `stop-afu.command` 可停止后台服务。
+完成一次 `npm ci` 后，双击 `start-afu.command` 即可启动，再次双击只会打开正在运行的 AFU。使用 `stop-afu.command` 停止后台服务。
 
-也可以在终端中运行：
+也可以在终端运行：
 
 ```bash
 ./start-afu.command
 ./stop-afu.command
 ```
 
-启动器支持 Homebrew、Volta、asdf、nvm 和 fnm 的常见 Node.js 安装位置，也可以通过 `AFU_NODE_PATH` 指定 Node.js 可执行文件。运行日志保存在 `data/afu-macos.log`。
+启动器支持 Homebrew、Volta、asdf、nvm 和 fnm 的常见 Node.js 安装位置。也可以通过 `AFU_NODE_PATH` 指定 Node.js 可执行文件；运行日志位于 `data/afu-macos.log`。
 
-## AI 配置
+## AFU 能帮你做什么
 
-在 **Settings → LLM analysis** 中填写服务地址、模型和独立 API key，然后选择处理模式：
+### 用 AI 快速判断是否值得读
 
-例如，可以使用 Qwen3.8 27B 等支持 OpenAI-compatible API 的模型。
+AFU 可以在论文列表中显示一句话中文解读，并在原文、中文翻译和左右双栏摘要之间切换，不必先打开每一篇论文。你可以让它自动处理进入 Focus 的新论文和版本更新，也可以只分析手动选中的论文。
+
+### 先完整收下，再决定看什么
+
+- 按 arXiv Category 持续发现新论文和更高版本
+- 所有同步结果保留在 **All Papers**，不会因为相关度较低而消失
+- 高相关论文、版本更新和你主动标记为未读的论文进入 **Focus Inbox**
+- 按 arXiv ID 自动去重，并保存本地实际观察到的版本历史
+
+### 用 Collection 告诉 AFU 你关心什么
+
+把值得继续关注的论文放进不同 Collection。启用 Embedding 后，AFU 会根据这些论文的向量建立兴趣画像，为新论文预测最接近的类别，并用相关度筛选 Focus Inbox。
+
+预测标签只用于辅助浏览，不会自动移动或归档论文。Archive 中的论文也不会参与兴趣分类。
+
+### 把论文当作一条可处理的队列
+
+- 使用 Read / Unread 记录阅读状态
+- 用 Archive 收起不感兴趣的论文，同时保留元数据和 AI 内容
+- 建立多个 Collection，并为 Collection 和 Archive 设置颜色
+- 为每篇论文写 Markdown 笔记，实时预览并自动保存
+- 搜索标题、作者、摘要、Category、arXiv ID 和本地笔记
+- 使用状态、Category、更新时间等筛选条件和批量操作
+
+一个简单的使用习惯是：先浏览 Focus，值得跟进的放进 Collection，处理完的归档；需要回查时，再到 All Papers 搜索完整结果。
+
+## 可选：启用 AI
+
+在 **Settings → LLM analysis** 中填写服务地址、模型和 API key，然后选择处理方式：
 
 - **关闭**：不创建新任务，但继续显示已有结果
-- **自动**：Embedding 分类完成后，只自动分析进入 Focus 的新论文和新版本；也可以在 All Papers 中按需点击单篇论文的“AI 翻译总结”
-- **手动**：只分析在 Focus 或 All Papers 中勾选并提交的论文
+- **自动**：自动分析进入 Focus 的新论文和新版本
+- **手动**：只分析你在 Focus 或 All Papers 中选中的论文
 
-也可以在启动前通过环境变量提供默认配置：
+自动模式下，也可以在 All Papers 中临时分析某一篇论文。
+
+<details>
+<summary>通过环境变量提供 LLM 默认配置</summary>
 
 ```powershell
 $env:AFU_AI_BASE_URL = 'http://127.0.0.1:8000/v1'
@@ -110,37 +91,30 @@ npm start
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `AFU_AI_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible API 地址 |
-| `AFU_AI_MODEL` | `Qwen/Qwen3.8-27B-FP8` | AI 模型名称 |
+| `AFU_AI_MODEL` | `Qwen/Qwen3.8-27B-FP8` | 模型名称 |
 | `AFU_AI_API_KEY` | 空 | 可选 Bearer Token |
 
-Settings 中保存的配置优先用于后续启动。
+Settings 中保存的配置会优先用于后续启动。
 
-LLM API key 可以保存在 Settings 中，也可以通过 `AFU_AI_API_KEY` 提供。保存在 Settings 中的密钥不会写入 JSON 备份。
+</details>
 
-## Embedding 与默认分类
+## 可选：启用 Embedding 与混合搜索
 
-在 **Settings → Embedding & classification** 中配置独立的 Embedding 服务。默认配置面向 vLLM 的 OpenAI-compatible `/v1/embeddings` 接口：
+在 **Settings → Embedding & classification** 中配置独立的 Embedding 服务。默认配置适用于 vLLM 的 OpenAI-compatible `/v1/embeddings` 接口：
 
 ```text
 Base URL  http://127.0.0.1:8001/v1
 Model     Qwen/Qwen3-Embedding-0.6B
 ```
 
-启用后，AFU 会为本地论文生成 Embedding，并根据各个 Collection 中的论文建立兴趣分类。预测结果足够明确时，论文卡片会显示对应的彩色标签。你可以在 Settings 中分别调整分类门槛、领先幅度（Winning margin）和 Focus 最低相关度；Collection 内容变化后，分类会自动更新。
+AFU 默认将相关度达到 `0.60` 的论文放入 Focus，分类门槛默认为 `0.55`。你可以在 Settings 中调整门槛和领先幅度；Collection 内容变化后，结果会自动更新。版本更新和你主动标记为未读的论文不受 Focus 门槛限制。
 
-Focus Inbox 默认最低相关度为 `0.60`，分类门槛默认为 `0.55`；Focus 门槛不能低于分类门槛。版本更新和你主动标记为未读的论文不受门槛限制；未进入 Focus 的论文不会丢失，仍可在 All Papers 中搜索和处理。
+搜索会结合 SQLite FTS5 的关键词结果与 Dense Embedding。Embedding 关闭、Dense 权重设为零或服务临时不可用时，会自动回退到纯关键词搜索。
 
-Archive 中的论文不会参与分类。预测标签仅用于辅助浏览，不会自动移动或归档论文。
+只有查询文本会在 Dense 搜索时发送给 Embedding 服务，本地笔记不会发送。
 
-## 混合自然语言搜索
-
-论文列表顶部的搜索框使用 SQLite FTS5 BM25 与 Dense Embedding 进行混合检索。BM25 覆盖标题、作者、摘要、分类、arXiv ID 和本地笔记；Dense 检索只发送查询文本，并与现有的标题加摘要向量比较，本地笔记不会发送给 Embedding 服务。
-
-在 **Settings → Hybrid search** 中可以调整 Dense 权重，BM25 权重会自动取剩余比例。两路结果使用加权 Reciprocal Rank Fusion 合并。Embedding 关闭、Dense 权重设为零或服务临时不可用时，搜索会自动使用 100% BM25，并在结果上方显示当前实际搜索模式。
-
-搜索由 Enter 或 **Search** 按钮提交，以避免输入过程中反复调用 Embedding API；清空搜索框会恢复普通论文列表。
-
-Embedding 服务也可以通过环境变量提供默认值：
+<details>
+<summary>通过环境变量提供 Embedding 默认配置</summary>
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
@@ -148,22 +122,24 @@ Embedding 服务也可以通过环境变量提供默认值：
 | `AFU_EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | Embedding 模型名称 |
 | `AFU_EMBEDDING_API_KEY` | 空 | 可选 Bearer Token |
 
-## 同步与数据
+</details>
 
-AFU 通过 arXiv RSS 持续发现新论文和版本更新，从你添加订阅时开始追踪。自动同步间隔可设置为 1–7 天，也可以随时点击 **Sync now**。
+## 数据与隐私
 
-Archive 会将论文移出 Focus 和 All Papers，但保留论文信息、版本历史和 AI 结果。若确定不再需要，可以在 Archive 中选择“删除本地内容”。以后出现更高版本时，这篇论文仍会作为 **Updated** 重新进入 Focus。
+订阅、论文元数据、阅读状态、Collection、笔记、AI 结果和 Embedding 都保存在本地 SQLite 中。AFU 不下载 PDF、不要求账户，服务默认只监听 `127.0.0.1`。
 
-AFU 不下载 PDF；论文信息、阅读状态、AI 结果和 Embedding 都保存在本地 SQLite 中。
+如果启用 LLM 或 Embedding，生成结果所需的论文标题和摘要会发送到你配置的 API；Dense 搜索还会发送查询文本。除此之外，本地笔记不会发送给这些服务。
 
-数据库和备份默认保存在：
+在 Settings 中填写的 API key 会保存在本地 SQLite 的 secrets 表中，不会进入 JSON 备份；它并未存入操作系统钥匙串，请妥善保护数据目录。
+
+数据库和备份默认位于：
 
 ```text
 data/afu.db
 data/backups/
 ```
 
-可以通过以下环境变量调整本地运行位置：
+可以在 Settings 中导出或恢复完整 JSON 备份。恢复前，AFU 会自动备份当前数据库。
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
@@ -171,7 +147,13 @@ data/backups/
 | `AFU_DATABASE_PATH` | `./data/afu.db` | 自定义数据库文件路径 |
 | `PORT` | `43110` | 本地 HTTP 端口 |
 
-旧版 `data/localrss.db` 会被自动识别。你可以在 Settings 中导出或恢复 JSON 备份；恢复前，AFU 会自动备份当前数据库。
+旧版 `data/localrss.db` 会被自动识别。
+
+## 同步说明
+
+AFU 从你添加订阅时开始，通过 arXiv RSS 发现之后出现的新论文和版本更新。自动同步间隔可以设为 1–7 天，也可以随时点击 **Sync now**。
+
+Archive 会把论文移出 Focus 和 All Papers，但保留本地内容。选择“删除本地内容”后，相同版本不会被 RSS 再次加入；将来出现更高版本时，它仍会作为 **Updated** 回到 Focus。
 
 ## 开发
 
@@ -185,12 +167,10 @@ npm run check
 
 ```text
 public/       浏览器界面
-scripts/      Windows 托盘、macOS 启动与开发脚本
-src/          HTTP 服务、数据库、同步与 AI 逻辑
+scripts/      Windows 托盘、macOS 启动与辅助脚本
+src/          HTTP 服务、数据库、同步、搜索与 AI 逻辑
 test/         Node.js 测试
 ```
-
-相关资料：
 
 - [参与贡献](./CONTRIBUTING.md)
 - [安全策略](./SECURITY.md)
